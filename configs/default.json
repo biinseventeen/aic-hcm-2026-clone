@@ -1,0 +1,27 @@
+{
+  "paths": {
+    "data_root": "data/raw",
+    "index_dir": "data/processed/index",
+    "submission_dir": "data/processed/submissions",
+    "report_dir": "data/processed/reports",
+    "video_cache_dir": "data/processed/video_cache",
+    "devset_dir": "devset"
+  },
+  "answer_span": {
+    "kis": 25,
+    "qa": 25,
+    "trake": 10
+  },
+  "retrieval": {
+    "channel_depth": 2000,
+    "rrf_eta": 60,
+    "n_candidates": 500,
+    "n_verify": 50,
+    "dedup_cosine": 0.92,
+    "max_shots_per_video": 12,
+    "locus_pad_seconds": 0.5
+  },
+  "fps_default": 25.0,
+  "seed": 0,
+  "text_encoder": "clip-ViT-B-32"
+}

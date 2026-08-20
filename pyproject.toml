@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aic"
+version = "0.1.0"
+description = "Multi-task video retrieval for AI Challenge HCM 2026 — preliminary round"
+requires-python = ">=3.11"
+
+# Core dependency: everything needed to build the index from the organiser-supplied features,
+# allocate the 100 slots and write submission files. Nothing here needs a GPU.
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# The text encoder — REQUIRED to run real queries. Without it the dense channel is silent and
+# the score is zero. It must share the embedding space of the organiser's clip-ViT-B-32.
+encoder = [
+    "sentence-transformers>=3.0",
+    "torch>=2.2",
+]
+# The TRAKE branch and anything else needing pixels at full temporal resolution.
+video = [
+    "pillow>=10.0",
+]
+# The HTTP backend. The core package depends on NO web framework — see src/aic/api/__init__.py.
+backend = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+
+# Development tooling. This is a dependency-group rather than an extra: uv installs it by default
+# on `uv sync`, and it is never part of the installable package.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    # httpx is needed by fastapi.testclient; the API tests skip themselves without it.
+    "httpx>=0.27",
+    "ruff>=0.16",
+    "pre-commit>=4.0",
+]
+
+[project.scripts]
+aic = "aic.cli:main"
+
+[tool.uv]
+# This machine terminates TLS with a certificate uv's bundled roots do not trust, so uv must use
+# the operating system's certificate store. Harmless elsewhere; without it every uv command fails
+# with "invalid peer certificate: UnknownIssuer".
+native-tls = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "src"]
+# --doctest-modules: docstrings in src carry specification-grade examples (the frame index
+# convention, worked Final Score values). They must be executed as tests.
+addopts = "--doctest-modules -p no:cacheprovider"
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes
+    "I",           # isort
+    "UP",          # pyupgrade
+    "B",           # flake8-bugbear
+    "C4",          # flake8-comprehensions
+    "SIM",         # flake8-simplify
+    "PIE",         # flake8-pie
+    "RET",         # flake8-return
+    "ARG",         # unused arguments
+    "PTH",         # use pathlib
+    "RUF",         # ruff-specific
+]
+ignore = [
+    # Vietnamese is data in this project: stop-word lists, domain keywords, test
+    # fixtures and quotations from the competition rules. Ruff's ambiguous-character
+    # rules fire on the diacritics and would force noqa comments onto real data.
+    "RUF001", "RUF002", "RUF003",
+    # Long `if cond: raise` chains read better than the TRY/EM refactors here.
+    "RET505",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately touch private helpers and build deep fixtures.
+"tests/*" = ["ARG001", "SIM117"]
+# Scripts import from a sys.path entry set up at runtime, before other imports.
+"scripts/*" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["aic"]

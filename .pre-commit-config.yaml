@@ -1,0 +1,36 @@
+# Run `uv run pre-commit install` once; the hooks then run on every `git commit`.
+# Run over the whole tree at any time with `uv run pre-commit run --all-files`.
+#
+# Only the ruff hooks come from a third-party repo. The remaining checks are `local` hooks calling
+# this project's own environment: the generic `pre-commit-hooks` repo hangs on this machine once it
+# is handed more than a handful of files, and every check below needs nothing beyond the standard
+# library, so an isolated hook environment would buy nothing.
+default_language_version:
+  python: python3
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.3
+    hooks:
+      # Lint first, so autofixes land before the formatter reflows anything.
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  # `uv run --frozen` pins these to the workspace environment described by uv.lock. Plain
+  # `python` would resolve to whatever happens to be on PATH, which is how a hook ends up
+  # testing a different interpreter than the one the project targets.
+  - repo: local
+    hooks:
+      - id: repo-hygiene
+        name: repo hygiene (size, TOML/JSON validity, whitespace)
+        entry: uv run --frozen python scripts/check_repo_hygiene.py --max-kb 2048
+        language: system
+        types_or: [markdown, toml, yaml, json, text]
+
+      - id: pytest
+        name: pytest (321 tests, ~4s)
+        entry: uv run --frozen python -m pytest -q
+        language: system
+        pass_filenames: false
+        always_run: true
