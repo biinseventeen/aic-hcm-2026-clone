@@ -101,12 +101,12 @@ def cmd_validate(args, cfg: Config) -> int:
     return 0
 
 
-def cmd_build_index(args, cfg: Config) -> int:  # noqa: ARG001 — uniform dispatch signature
+def cmd_build_index(args, cfg: Config) -> int:
     from .data.features import build_dense_index
     from .data.keyframes import load_all_keyframe_tables
     from .data.layout import DataRoot
     from .index.shots import build_shot_table
-    from .index.text import TextIndex, docs_from_media_info
+    from .index.text import TextIndex, docs_from_media_info, docs_from_titles
 
     root = DataRoot(cfg.paths.data_root)
     out = Path(cfg.paths.index_dir)
@@ -115,8 +115,12 @@ def cmd_build_index(args, cfg: Config) -> int:  # noqa: ARG001 — uniform dispa
     n_keyframes = sum(len(table) for table in tables.values())
     print(f"{len(tables)} videos, {n_keyframes:,} keyframes")
 
-    print("\n[1/3] dense visual index (P3)")
-    build_dense_index(root, tables=tables).save(out)
+    only = getattr(args, "only", "all")
+    if only in ("all", "dense"):
+        print("\n[1/3] dense visual index (P3)")
+        build_dense_index(root, tables=tables).save(out)
+    else:
+        print(f"\n[1/3] dense visual index: skipped (--only {only})")
 
     print("\n[2/3] shot table (P2)")
     media_info = {video_id: root.media_info.read_json(f"{video_id}.json") for video_id in tables}
@@ -126,7 +130,8 @@ def cmd_build_index(args, cfg: Config) -> int:  # noqa: ARG001 — uniform dispa
         if isinstance(info.get("length"), int | float)
     }
     shot_table = build_shot_table(tables, fps_default=cfg.fps_default, last_frames=last_frames)
-    shot_table.save(out / "shots.json")
+    if only in ("all", "shots"):
+        shot_table.save(out / "shots.json")
     stats = shot_table.stats(tables)
     print(
         f"  {len(shot_table):,} shots; median length {stats['median_s']:.1f}s, "
@@ -135,11 +140,18 @@ def cmd_build_index(args, cfg: Config) -> int:  # noqa: ARG001 — uniform dispa
     if stats["over_20s_pct"] < 0.01:
         print("  [i] no shot exceeds 20s: long-shot splitting does not trigger on batch 1")
 
+    if only not in ("all", "text"):
+        print(f"\nindex written to {out}")
+        return 0
+
     print("\n[3/3] sparse text index (P4/P5 — currently media-info only)")
     text_index = TextIndex(docs=docs_from_media_info(media_info, last_frames=last_frames)).build(
         verbose=True
     )
     text_index.save(out / "text_media.json")
+    title_index = TextIndex(docs=docs_from_titles(media_info)).build(verbose=False)
+    title_index.save(out / "text_title.json")
+    print(f"  title-only index: {len(title_index)} documents (boilerplate-free channel)")
     print(
         "  [!] no OCR and no speech channel yet. Both text retrieval channels are missing — "
         "see docs/CONSTRAINTS.md, items G2 and G3."
@@ -189,11 +201,20 @@ def _solve_and_print(
     task_hint=None,
     verbose: bool = True,
     hedge_answers: bool = True,
+    answers: list[tuple[str, float]] | None = None,
+    pins: list[tuple[str, int]] | None = None,
+    english: str = "",
 ) -> SolveResult | None:
     """Call the engine and print diagnostics. Returns None when the query itself is invalid."""
     try:
         result = engine.solve(
-            text, query_id=query_id, task_hint=task_hint, hedge_answers=hedge_answers
+            text,
+            query_id=query_id,
+            task_hint=task_hint,
+            hedge_answers=hedge_answers,
+            answers=answers,
+            pins=pins,
+            english=english,
         )
     except ValueError as exc:
         print(f"  [!] {exc}")
@@ -235,6 +256,37 @@ def cmd_run(args, cfg: Config) -> int:
     if not isinstance(queries, dict):
         print("the query file must be a JSON object {query_id: text}")
         return 2
+
+    # Human-supplied Q&A answers. Until a VQA model exists this is the only way the answer axis
+    # can score at all, so it is worth a file of its own rather than a code change per round.
+    supplied: dict[str, list[tuple[str, float]]] = {}
+    if getattr(args, "answers", None):
+        payload = json.loads(Path(args.answers).read_text(encoding="utf-8"))
+        for query_id, entries in payload.items():
+            if query_id.startswith("_"):
+                continue
+            supplied[query_id] = [
+                (entry["text"], float(entry.get("prob", 1.0)))
+                if isinstance(entry, dict)
+                else (str(entry), 1.0)
+                for entry in entries
+            ]
+        print(f"answer hypotheses supplied for {len(supplied)} queries: {sorted(supplied)}")
+
+    english: dict[str, str] = {}
+    if getattr(args, "english", None):
+        payload = json.loads(Path(args.english).read_text(encoding="utf-8"))
+        english = {k: v for k, v in payload.items() if not k.startswith("_") and isinstance(v, str)}
+        print(f"English renderings supplied for {len(english)} queries")
+
+    pins: dict[str, list[tuple[str, int]]] = {}
+    if getattr(args, "pins", None):
+        payload = json.loads(Path(args.pins).read_text(encoding="utf-8"))
+        for query_id, entries in payload.items():
+            if query_id.startswith("_"):
+                continue
+            pins[query_id] = [(entry["video_id"], int(entry["frame"])) for entry in entries]
+        print(f"verified rows pinned for {len(pins)} queries: {sorted(pins)}")
     engine = Engine.load(cfg, allow_stub=args.allow_stub)
     if engine.encoder_is_stub and not args.allow_stub_submission:
         print(
@@ -245,6 +297,11 @@ def cmd_run(args, cfg: Config) -> int:
         return 2
 
     out_dir = Path(cfg.paths.submission_dir)
+    if getattr(args, "out", None):
+        # Two published query sets number their queries p1-1..p1-25 while assigning them
+        # different tasks, so one directory per set is the only way not to overwrite half of it.
+        candidate = Path(args.out)
+        out_dir = candidate if candidate.is_absolute() else out_dir / candidate
     files, total_errors = [], 0
     for position, (query_id, text) in enumerate(queries.items(), 1):
         print(f"\n{'=' * 72}\n[{position}/{len(queries)}] {query_id}: {text[:70]}")
@@ -254,6 +311,9 @@ def cmd_run(args, cfg: Config) -> int:
             text,
             verbose=args.verbose,
             hedge_answers=not args.no_hedge_answers,
+            answers=supplied.get(query_id),
+            pins=pins.get(query_id),
+            english=english.get(query_id, ""),
         )
         if result is None:
             continue
@@ -270,6 +330,7 @@ def cmd_run(args, cfg: Config) -> int:
 
     if files and not total_errors:
         archive = package_submission(files, out_dir / "submission.zip")
+        print("  the archive holds a submission/ directory, as the result specification requires")
         print(f"\npackaged: {archive}")
     elif total_errors:
         print(f"\nNOT packaged: {total_errors} errors remain. Fix them before submitting.")
@@ -310,6 +371,26 @@ def cmd_evaluate(args, cfg: Config) -> int:
         print("\nno query has been annotated yet — run `devset`, then fill in the file.")
         return 1
 
+    supplied: dict[str, list[tuple[str, float]]] = {}
+    if getattr(args, "answers", None):
+        payload = json.loads(Path(args.answers).read_text(encoding="utf-8"))
+        for query_id, entries in payload.items():
+            if query_id.startswith("_"):
+                continue
+            supplied[query_id] = [
+                (entry["text"], float(entry.get("prob", 1.0)))
+                if isinstance(entry, dict)
+                else (str(entry), 1.0)
+                for entry in entries
+            ]
+
+    pinned: dict[str, list[tuple[str, int]]] = {}
+    if getattr(args, "pins", None):
+        payload = json.loads(Path(args.pins).read_text(encoding="utf-8"))
+        for query_id, entries in payload.items():
+            if not query_id.startswith("_"):
+                pinned[query_id] = [(e["video_id"], int(e["frame"])) for e in entries]
+
     engine = Engine.load(cfg, allow_stub=args.allow_stub)
     report = EvalReport()
     print()
@@ -317,7 +398,15 @@ def cmd_evaluate(args, cfg: Config) -> int:
         truth = devset.truths.get(query_id)
         if truth is None:
             continue
-        result = _solve_and_print(engine, query_id, text, task_hint=truth.task, verbose=False)
+        result = _solve_and_print(
+            engine,
+            query_id,
+            text,
+            task_hint=truth.task,
+            verbose=False,
+            answers=supplied.get(query_id),
+            pins=pinned.get(query_id),
+        )
         if result is None:
             continue
         score = score_submission(result.submission, truth)
@@ -380,15 +469,22 @@ def cmd_check_submission(args, cfg: Config) -> int:
         return 1
     print("\nno blocking errors.")
     print(
-        "Note: the submission file format is an assumption taken from previous seasons and has "
-        "not been confirmed by the AIC 2026 rules. See docs/SUBMISSION.md."
+        "Note: the file format follows the published result specification (one .csv per query, "
+        "no header, UTF-8, archive holding a submission/ directory). What is still unconfirmed "
+        "is how a Q&A answer is compared — see docs/SUBMISSION.md §2."
     )
     return 0
 
 
 def cmd_selftest(args, cfg: Config) -> int:  # noqa: ARG001 — uniform dispatch signature
     """Print a set of sample submission files to send the organisers for confirmation."""
-    from .submit.writer import Answer, QuerySubmission, SubmissionNaming, write_submission
+    from .submit.writer import (
+        MAX_ANSWER_CHARS,
+        Answer,
+        QuerySubmission,
+        SubmissionNaming,
+        write_submission,
+    )
 
     naming = SubmissionNaming()
     out_dir = Path(cfg.paths.submission_dir) / "_selftest"
@@ -416,10 +512,15 @@ def cmd_selftest(args, cfg: Config) -> int:  # noqa: ARG001 — uniform dispatch
         print(f"--- {path.name} ---")
         print(path.read_text(encoding="utf-8").replace("\r\n", "\n").rstrip())
         print()
-    print("Assumptions needing confirmation:")
+    print("Format in use — all of it stated by the result specification:")
     print(f"  - filename            : {naming.filename}")
     print(f"  - delimiter           : {naming.delimiter!r}   header row: {naming.include_header}")
     print(f"  - video_id extension  : {naming.video_extension!r} (empty = no .mp4)")
+    print(f"  - archive             : {naming.zip_name} containing {naming.zip_dir}/")
+    print(f"  - Q&A answer limit    : {MAX_ANSWER_CHARS} characters")
+    print("Still to confirm with the organisers:")
+    print("  - Q&A: is the answer compared semantically or as an exact string? The published")
+    print("    specification says both, in two different places.")
     print("  - Q&A: may several rows share a (video_id, frame_id) with different answers?")
     print(f"\nfiles at: {out_dir}")
     return 0
@@ -456,7 +557,16 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate", help="P1 plus cross-checks (BLOCKING ITEM)")
     validate.add_argument("--fast", action="store_true", help="skip the CLIP feature checks")
 
-    subparsers.add_parser("build-index", help="build the dense, shot and text indexes")
+    build_index = subparsers.add_parser(
+        "build-index", help="build the dense, shot and text indexes"
+    )
+    build_index.add_argument(
+        "--only",
+        choices=("all", "dense", "shots", "text"),
+        default="all",
+        help="rebuild one stage only. The dense index is 173 MiB and takes minutes; iterating "
+        "on the sparse channel does not need it.",
+    )
 
     devset = subparsers.add_parser("devset", help="blind sampling for the internal eval set")
     devset.add_argument("--kis", type=int, default=40)
@@ -484,6 +594,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="run a whole query set and write submissions")
     run.add_argument("queries", help="JSON {query_id: text}")
+    run.add_argument(
+        "--answers",
+        default=None,
+        help="JSON {query_id: [{text, prob}, ...]} of Q&A answer hypotheses. Without it the "
+        "answer axis of every Q&A row scores zero, because no VQA model is built (G5).",
+    )
+    run.add_argument(
+        "--pins",
+        default=None,
+        help="JSON {query_id: [{video_id, frame}, ...]} of rows a human has verified by looking "
+        "at the frame. They go to the head of the list, where slot 1 is worth a fifth of the "
+        "query's score.",
+    )
+    run.add_argument(
+        "--english",
+        default=None,
+        help="JSON {query_id: english text} feeding the dense_translated channel. CLIP's text "
+        "tower is trained on English; the raw Vietnamese query keeps its own channel regardless.",
+    )
+    run.add_argument(
+        "--out",
+        default=None,
+        help="subdirectory of the submission directory to write into, e.g. --out phase1",
+    )
     run.add_argument("--verbose", action="store_true")
     run.add_argument("--allow-stub", action="store_true")
     run.add_argument(
@@ -495,6 +629,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     evaluate = subparsers.add_parser("evaluate", help="score against the internal eval set")
     evaluate.add_argument("--devset", default=None)
+    evaluate.add_argument(
+        "--answers",
+        default=None,
+        help="the same Q&A answer hypotheses file passed to `run` — scoring the pipeline as it "
+        "would actually be submitted, rather than with an empty answer axis",
+    )
+    evaluate.add_argument("--pins", default=None, help="the same verified-row file passed to `run`")
     evaluate.add_argument("--allow-stub", action="store_true")
 
     check = subparsers.add_parser("check-submission", help="validate submission files")

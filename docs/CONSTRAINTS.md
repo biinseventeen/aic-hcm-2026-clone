@@ -25,7 +25,7 @@ State at this update: `aic validate` passes (0 mismatches over 177,321 keyframes
 | C1 | 100-answer ceiling; the score is a step function | invariant |
 | C2 | The answer is an interval, so the task is coverage | invariant |
 | C3 | The answer-span length `L` is not published | invariant (missing information) |
-| C4 | No text encoder in the shared embedding space | phase parameter |
+| C4 | Text encoder in the shared embedding space — **installed, resolved** | phase parameter |
 | C5 | No `ffmpeg`; TRAKE needs full fps | phase parameter / invariant |
 | C6 | Compute budget `B` and device memory `V` | phase parameter |
 | C7 | Disk capacity `D` | phase parameter |
@@ -91,12 +91,31 @@ The organiser-supplied image features come from `clip-ViT-B-32`. The text tower 
 tower of **that exact** checkpoint. A different model produces meaningless cosine similarities, and
 the failure is **silent**.
 
-> **State: BLOCKING.** `sentence-transformers` is not part of the default install. Without it the
-> dense retrieval channel is silent and every query scores zero.
+> **State: RESOLVED on this machine.** `sentence-transformers` 512-dim `clip-ViT-B-32` loads and
+> matches the index dimension.
 >
 > ```bash
-> uv sync --extra encoder
+> uv sync --extra backend --extra encoder --extra video
 > ```
+>
+> Three things had to be true, and two of them are not obvious:
+>
+> 1. **All the extras at once.** `uv sync --extra encoder` alone *removes* `fastapi`, because a sync
+>    prunes whatever the requested extras do not name. Two API tests started skipping silently.
+> 2. **`pillow`** (the `video` extra). Loading `clip-ViT-B-32` through `sentence-transformers`
+>    builds the full CLIP processor, image tower included, so it refuses to load without an image
+>    backend — even though only the text tower is ever used.
+> 3. **A certificate store Python trusts.** The weights come from huggingface.co, and this machine
+>    terminates TLS with a certificate the bundled CA roots cannot verify — the same reason
+>    `pyproject.toml` sets `native-tls = true` for uv. `curl` reaches the host with `-k` and fails
+>    without it. Fetching the weights once through `truststore`, which hands Python the operating
+>    system's certificate store, populates the HuggingFace cache; from then on the pipeline loads
+>    offline (`HF_HUB_OFFLINE=1`) and needs neither `truststore` nor the network. `truststore` is
+>    therefore *not* a project dependency.
+>
+> `torch` resolves to **2.13.0+cpu** — `torch.cuda.is_available()` is False on a machine with an
+> RTX 4060. Text encoding of a 24-query set costs a fraction of a second either way, so this only
+> matters for the GPU-bound channels (OCR, speech, VQA) that are not built. See C6.
 >
 > `load_text_encoder` tries three routes (`sentence-transformers` -> `open_clip` ->
 > `transformers`) and checks the dimensionality; `StubTextEncoder` runs only when explicitly
@@ -243,6 +262,17 @@ which is a known noise source, and it only goes away once G2 and G3 exist.
 `aic.tasks.qa` generates answer candidates, but `answer_prob` is not calibrated by any model. The
 answer score is therefore zero and the third Q&A failure axis is wide open. Needs GPU.
 
+> **Routed around, not solved.** `Engine.solve(answers=...)` and `aic run --answers` let a human (or
+> any future model) supply the hypotheses, and `pins=` puts a verified `(video, frame)` row at the
+> head of the list. The measurement that forced this: with a placeholder answer, the three Q&A
+> queries of the mock set were a guaranteed zero — 12.5 % of the total — while retrieval had already
+> put the correct video in slot 1 for one of them. With the answers read off the frames by hand, all
+> three score 1.0 in `aic evaluate`.
+>
+> All three answers were **on-screen text**: a commune name on an event banner, a poem couplet
+> beside a bust, a dish name on a recipe sheet. That is a direct argument for G2 (OCR) over a
+> generative VQA model as the next GPU investment for this task.
+
 ---
 
 ## R — Open risks
@@ -278,15 +308,40 @@ could have been covered.
 This is a question worth asking the organisers. Failing that, it is a hyperparameter to calibrate on
 the internal evaluation set (`aic devset` plus `aic evaluate`).
 
+> **The scale is settled: the portal reports Final Score x 10.** The round-1 submission with eight
+> hand-verified answers scored **3.2**, against a mean Final Score of **0.3200** measured offline by
+> `aic evaluate` on the same files — exact agreement, to four digits. The earlier 0.8 and 0.2 were
+> 0.08 and 0.02 on the same scale. Two consequences: `aic.core.objective` is a faithful replica of
+> the scoring function, and 8 verified answers x 1.0 / 25 queries = 0.32 means the **other 17
+> contributed exactly nothing** — the whole score came from the pins.
+>
+> **First evidence, from the scored submission.** The organisers returned 0.2 on the mock set. With
+> Q&A and TRAKE structurally unable to score at the time, that puts roughly 0.26 mean on the 18 KIS
+> queries, against 0.17 predicted by the coverage model with `L = 25`. Reality beating the model by
+> half is consistent with the true `L` being **wider** than 25 — the direction R3 warns about — but
+> one aggregate number cannot separate that from an under-confident posterior. The clean experiment
+> is one submission that changes `answer_span` and nothing else.
+>
+> `devset/demo/ground-truth.json` now carries 3 of 24 queries annotated by hand, which is the first
+> offline measurement this project has ever had. It is far too small to calibrate `L`; it is enough
+> to catch a regression that zeroes a task.
+
 ### R4. How "matches semantically" is decided for Q&A
 
-The rules say the answer must match the ground truth semantically, but not by what mechanism: exact
-string match, match after normalisation, or a semantic judge. This decides how answers should be
-generated: under exact matching an answer must be short and in canonical form; under a semantic judge
-there is more latitude in phrasing.
+The published result specification contradicts itself here, which makes this the sharpest open risk
+in the document: the Q&A section says the answer is compared "chính xác **về mặt ngữ nghĩa**"
+(semantically), and the closing notes say "so sánh dưới dạng **chuỗi chính xác**" (as an exact
+string). The two readings call for different answers: exact matching wants a short canonical form,
+a semantic judge allows latitude in phrasing.
 
-`validate()` currently warns when an answer exceeds 200 characters, on the assumption that a long
-answer is more likely to be judged a non-match.
+The strategy that survives both is to spend a few slots on the plausible phrasings of one answer
+(`DESIGN.md` P11, `--answers` takes several per query), and to treat every internal Q&A number as an
+**upper bound**: `aic.eval.score` implements the generous reading and records which matching tier
+each hit used, so subtracting the non-`exact` hits gives the pessimistic number without re-running.
+
+`validate()` enforces the 100-character limit the specification states, as an error, and warns about
+leading or trailing whitespace — whitespace is preserved rather than trimmed, so " 5" and "5" are two
+different answers under the strict reading.
 
 ### R5. ~~Coordinate order in `detection_boxes`~~ — CLOSED
 
@@ -294,12 +349,22 @@ The rules, section 3, state it outright: `objects` is the output of **Faster R-C
 OpenImages V4**, referring to the TensorFlow documentation for the format. The order is
 `[ymin, xmin, ymax, xmax]`, normalised to `[0, 1]`. No longer a risk.
 
-### R6. There is no labelled internal evaluation set yet
+### R6. The labelled evaluation set covers 3 of 24 queries
 
-`aic devset` samples blind and `aic evaluate` can score, but no query has ground truth yet. Without
-it, every hyperparameter (`L`, `rrf_eta`, channel weights, `max_shots_per_video`) is a *reasoned*
-value rather than a *calibrated* one. This is a process risk rather than a code one, and it blocks
-answering R3 empirically. See `devset/README.md`.
+`aic devset` samples blind, and `devset/demo/ground-truth.json` now carries **3 of 24** queries of
+the organisers' mock set, annotated by reading the answer off the video frames. That is enough to
+catch a regression that zeroes a task — all three score 1.0 today, where two of them scored 0 before
+the answer axis existed — and nowhere near enough to calibrate anything: every hyperparameter (`L`,
+`rrf_eta`, the five channel weights, `max_shots_per_video`, `sparse_max_terms`) is still a *reasoned*
+value rather than a *calibrated* one.
+
+Two consequences worth stating plainly:
+
+* The 18 KIS queries have **no** ground truth, so the only feedback on the part of the system that
+  earns almost all of the score is one aggregate number per submission to the organisers' portal.
+* The three labelled queries come from the mock set, whose queries were written first and matched to
+  a clip afterwards — the bias weakness E6 describes. They are a regression test, not a tuning set.
+  Tuning still needs the blind-sampled set of `devset/README.md`.
 
 ---
 
@@ -307,7 +372,10 @@ answering R3 empirically. See `devset/README.md`.
 
 | # | Task | What it unblocks | Cost |
 |---|---|---|---|
-| 1 | `uv sync --extra encoder` (C4) | **Every** query | Minutes |
+| 1 | ~~`uv sync --extra encoder` (C4)~~ **done** | **Every** query | — |
+| 1b | ~~Translate the query before the dense channel (P7)~~ **done differently**: a second text tower in the same image space, no translation step | **Every** query; was the largest single lever | — |
+| 1c | ~~Clean up the sparse channel~~ **done**: IDF-pruned query terms, title-only channel | Slot 1, worth a fifth of every query | — |
+| 1d | OCR (P4) — measured: all three Q&A answers of the mock set were on-screen text | Q&A, and every query anchored on a caption | Days, needs GPU |
 | 2 | Ask the organisers about the format (R1) and `L` (R3) | Correctness of the submission | One email |
 | 3 | The `objects` channel (G1) | Retrieval + verification, no GPU needed | Hours |
 | 4 | A CUDA `torch` build (C6) plus `ffmpeg` (C5) | TRAKE, OCR, speech | Hours |

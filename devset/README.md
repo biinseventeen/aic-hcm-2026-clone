@@ -11,7 +11,7 @@ belief into a measurement.
 
 ## Why it sits outside `data/`
 
-All of `data/` is git-ignored: `data/raw` is a link to a 107 GiB corpus and `data/processed` is
+All of `data/` is git-ignored: `data/batch1` is a link to a 107 GiB corpus and `data/processed` is
 reproducible output of `aic build-index`. This set is neither. It is **hand-annotated content** —
 as much authored work as the source code — and losing it means redoing hours of frame-accurate
 labelling. It therefore lives in version-controlled space.
@@ -48,3 +48,14 @@ Minimum targets: 40 KIS, 20 Q&A, 15 TRAKE. For TRAKE, each moment needs a frame 
 With 15 TRAKE queries, one query is 6.7 percentage points. A small difference between two
 configurations is noise, not a result. `aic evaluate` prints this warning itself rather than letting
 the number be over-trusted.
+
+## The organisers' mock exam — `test/`
+
+`test/` holds the mock-exam ("thi thử") query set published by the organisers: 24 queries
+(18 KIS, 3 Q&A, 3 TRAKE), generated from their `.txt` files by
+[`../scripts/build_query_set.py`](../scripts/build_query_set.py). See
+[`test/README.md`](test/README.md) for the workflow and for what the set says about the code.
+
+Keep the two sets apart. The queries there were written first and matched to a clip afterwards —
+exactly the order the rule above forbids — so that set measures **format correctness and
+end-to-end behaviour**, while every tuning decision still comes from the blind-sampled set here.

@@ -15,7 +15,7 @@ uv run aic validate                              # P1 plus cross-checks (blockin
 
 ## 1. Data inventory
 
-The organisers supply six data families, 106.7 GiB compressed, under `AIC_DATA_ROOT` (the `data/raw`
+The organisers supply six data families, 106.7 GiB compressed, under `AIC_DATA_ROOT` (the `data/batch1`
 link, see `scripts/link_data.py`).
 
 | Family | Entries | Compressed | Extracted | Purpose |
@@ -235,6 +235,16 @@ and search is one `numpy` matrix multiplication.
 
 ## 5. `media-info/<video>.json`
 
+> **Measured consequence for retrieval, added after the first scored submission.** These documents
+> are not clean text: the `description` field carries subscribe links, hashtag walls, channel blurbs
+> and a newsroom address, and `keywords` is SEO tag soup. Length alone is not the problem — the
+> median document is 203 tokens and the widest is 291 — the problem is *topical breadth*. A
+> travel-show episode covering food, places and people overlaps lexically with almost every query,
+> so with a full-query BM25 one such episode took slot 1 of four of the 24 queries and appeared in
+> the top 5 of nine. Two fixes followed, both in `DESIGN.md` P8: prune the query to its highest-IDF
+> terms, and index titles separately from descriptions so a hit on curated text can be weighted
+> above a hit in boilerplate.
+
 YouTube metadata, ten keys:
 
 | Key | Example / type | Used for |
@@ -370,3 +380,39 @@ Three consequences:
    report a clear error when a family is absent — `tests/test_layout.py` locks that property.
 3. **The corpus will grow.** 130.7 hours is batch 1. Every cost estimate in `DESIGN.md` section 11
    scales when batch 2 arrives, and `objects` (§7) grows in proportion.
+
+---
+
+## 11. The organisers' baseline notebook
+
+`docs/AIC_2026_Baseline_v1.ipynb` is the organisers' own FiftyOne walkthrough. It is not a scoring
+specification — it loads keyframes, attaches the supplied detections and CLIP vectors, and hands the
+result to `fob.compute_similarity` — but it is the one place where they show *how they expect the
+supplied data to be read*. Four of our assumptions are independently confirmed by it, and one trap
+becomes visible.
+
+| What the notebook does | Consequence here |
+|---|---|
+| `model="clip-vit-base32-torch"`, and "cần tải đúng bản CLIP embedding từ model **CLIP ViT-B/32**" | Confirms §4: the text tower must be `clip-ViT-B-32`. `configs/default.json` says exactly that. |
+| Sorts each video's keyframe filenames, then indexes `clip-features/<video>.npy` by that order | Confirms §4's `row i ↔ keyframe n = i + 1` — see the caveat below. |
+| Reads `objects/<video>/<frameid>.json`, converts boxes as `[xmin, ymin, w, h]` from `[ymin, xmin, ymax, xmax]`, keeps `score > 0.4` | Confirms §7's box order, and fixes 0.4 as the organisers' own default threshold for the channel we have not built yet (G1). |
+| Directory names `keyframes/<video>/<nnn>.jpg`, `clip-features/`, `objects/` | Matches the layout `aic.data.layout.DataRoot` opens. |
+
+**The sorted-filename caveat.** Sorting filenames as *strings* equals ordering by keyframe `n` only
+while the zero-padding is wide enough. Measured on batch 1: every keyframe filename is three digits
+(`001.jpg`), and the largest video has **632** keyframes (`L25_V007`), so lexicographic and numeric
+order coincide everywhere and the notebook's alignment is identical to ours. At **1000** keyframes
+in one video the two orders diverge (`1000.jpg` sorts before `999.jpg`) and the whole embedding
+table of that video shifts, silently. If batch 2 contains a longer video, this must be re-checked —
+`aic build-index` aligns by `map-keyframes` row order, not by filename, so our side is safe either
+way.
+
+**The trap: `frameid` in the notebook is not the frame id to submit.** The notebook derives
+`sample['frameid']` from the image filename, so `001.jpg` becomes `1` — the keyframe **ordinal**.
+The value that scores is the video frame index, `floor(pts_time * fps)` from `map-keyframes` (§3.1),
+which for that same keyframe is typically in the hundreds or thousands. The two never coincide
+beyond the first frames. Anyone reading the baseline as a submission example, or copying a frame
+number out of the FiftyOne UI, submits the ordinal and scores zero on every row — with a file that
+validates cleanly. This is the single most expensive misreading available in the supplied material,
+which is why `aic validate` recomputes the convention over all 177,321 keyframes before anything is
+allowed to run.

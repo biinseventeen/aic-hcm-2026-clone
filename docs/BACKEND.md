@@ -26,6 +26,23 @@ uv run aic serve --port 8000       # or: uv run uvicorn aic.api.app:app --port 8
 Without a real encoder, add `--allow-stub` so the pipeline runs; `/health` then reports
 `status: "degraded"` and every response carries `degraded: true`.
 
+### What one engine holds
+
+`Engine.load()` loads five things, and two of them are optional in a way a caller should know about:
+
+| Field | Contents | If absent |
+|---|---|---|
+| `dense` | 173 MiB of keyframe vectors, `float16`, memory-mapped | fatal — nothing can run |
+| `shots` | shot table (176,707 shots) | fatal |
+| `text` | BM25 over `media-info` | the sparse and entity channels fall silent |
+| `title` | BM25 over titles only | the highest-weighted sparse channel falls silent |
+| `encoder` | `clip-ViT-B-32` text tower, 512 dimensions | fatal unless `allow_stub=True` |
+| `encoder_multilingual` | a second tower in the same image space, reading Vietnamese directly | a **warning** in `/health`; the English tower carries the query alone, which it does poorly for Vietnamese prose |
+
+An optional piece missing never raises: it appends to `Engine.warnings`, which `/health` returns.
+That is deliberate — a backend answering 200 OK while one retrieval channel is silent is exactly the
+failure that should be visible without reading logs.
+
 ## 2. Embedding it directly, without HTTP
 
 ```python
@@ -33,6 +50,16 @@ from aic.service import Engine
 
 engine = Engine.load()  # load ONCE at startup
 result = engine.solve("một diễn giả mặc áo đỏ", query_id="7")
+
+# Q&A answers come from the caller until a VQA model exists (CONSTRAINTS G5): the answer axis is
+# one of three conjuncts, so a row without it cannot score. `pins` puts rows a human has verified
+# by looking at the frame at the head of the list, where slot 1 is worth a fifth of the score.
+result = engine.solve(
+    text,
+    query_id="p1-15",
+    answers=[("Giang Ly", 0.5), ("Xã Giang Ly", 0.35)],
+    pins=[("L30_V072", 676)],
+)
 
 result.n_answers  # 100
 result.expected_final  # E[Final Score]
@@ -50,7 +77,7 @@ It does not depend on the process working directory — see §5.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health` | Engine state: `ready` / `degraded` / `loading` / `error` |
+| `GET` | `/health` | Engine state: `ready` / `degraded` / `loading` / `error`, plus `warnings` |
 | `POST` | `/solve` | Solve one query, returning up to 100 ordered answers |
 | `POST` | `/solve/batch` | Solve a batch (at most 50). One failing query does not fail the batch |
 | `POST` | `/parse` | Parse the query only — fast, no retrieval |
@@ -135,8 +162,8 @@ A server process has an arbitrary working directory. `configs/default.json` ther
 | `AIC_MAX_CONCURRENCY` | How many `solve` calls run in parallel (default 2) |
 | `AIC_ALLOW_STUB` | `1` = permit the stub encoder; `/health` reports `degraded` |
 
-`data/raw` is a **directory junction** pointing at the real corpus (107 GiB), created by
-`python scripts/link_data.py`. Thanks to it the configured path is `data/raw` on every machine, and
+`data/batch1` is a **directory junction** pointing at the real corpus (107 GiB), created by
+`python scripts/link_data.py`. Thanks to it the configured path is `data/batch1` on every machine, and
 the link is the only place that knows where the data actually is.
 
 Generated output goes to `data/processed/` (index, reports, submissions, video cache) — all of it

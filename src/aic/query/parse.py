@@ -33,7 +33,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
-from ..index.text import normalize_vi, tokenize_vi
+from ..index.text import _LABELLED_MOMENT_PATTERN, normalize_vi, tokenize_vi
 
 __all__ = ["ParsedQuery", "RuleParser", "TaskKind", "parse_query"]
 
@@ -232,6 +232,17 @@ _DOMAIN_KEYWORDS: dict[str, tuple[str, ...]] = {
 #: Splitting TRAKE moments: "(1) ... (2) ...", "1. ... 2. ...", or "bước 1: ...".
 _MOMENT_SPLIT = re.compile(r"(?:\(\s*\d+\s*\)|\b\d+\s*[.):]|\bbước\s+\d+\s*[:.]?)", re.IGNORECASE)
 
+#: Explicit moment labels, the form the organisers actually publish: each moment on its own line,
+#: opened by ``E1:``, ``E2:``, ... Where these are present they are unambiguous — the number of
+#: labels *is* N — so they take precedence over the heuristic split above, which would otherwise
+#: miss them entirely (routing a TRAKE query into the KIS branch) or mistake the lead-in sentence
+#: for a moment. The label **values** are not trusted: the published set contains a query numbered
+#: E1, E2, E2, E4, and that query still has four moments.
+#: Punctuation after the number is optional: the mock set writes "E1:", the first real set writes
+#: "E1 " with nothing but a space. The pattern lives in aic.index.text beside the other
+#: query-surface data.
+_LABELLED_MOMENT = re.compile(_LABELLED_MOMENT_PATTERN, re.MULTILINE)
+
 
 def _vietnamese_uppercase() -> str:
     """The Vietnamese uppercase letters, as the body of a regex character class.
@@ -315,9 +326,12 @@ class RuleParser:
             n_trake = sum(1 for marker in _TRAKE_MARKERS if marker in lowered)
             n_qa = sum(1 for marker in _QA_MARKERS if marker in lowered)
             moments = self._split_moments(raw)
-            if n_trake > 0 and len(moments) >= 2:
+            # Explicit E-labels are evidence on their own: a query listing "E1: ... E2: ..." is a
+            # moment sequence whether or not it also uses one of the Vietnamese marker phrases.
+            labelled = len(_LABELLED_MOMENT.findall(raw)) >= 2
+            if (n_trake > 0 or labelled) and len(moments) >= 2:
                 query.task = "trake"
-                query.task_confidence = min(1.0, 0.6 + 0.15 * n_trake)
+                query.task_confidence = min(1.0, (0.75 if labelled else 0.6) + 0.15 * n_trake)
             elif n_qa > 0:
                 query.task = "qa"
                 query.task_confidence = min(1.0, 0.55 + 0.15 * n_qa)
@@ -354,6 +368,16 @@ class RuleParser:
 
     @staticmethod
     def _split_moments(raw: str) -> list[str]:
+        # Labelled form first: the label count is N, and whatever precedes the first label is the
+        # lead-in sentence, not a moment.
+        labels = list(_LABELLED_MOMENT.finditer(raw))
+        if len(labels) >= 2:
+            starts = [match.end() for match in labels]
+            stops = [match.start() for match in labels[1:]] + [len(raw)]
+            return [
+                raw[start:stop].strip(" ,.;:\n–-")
+                for start, stop in zip(starts, stops, strict=True)
+            ]
         parts = [part.strip(" ,.;:–-") for part in _MOMENT_SPLIT.split(raw)]
         parts = [part for part in parts if len(part) >= 3]
         # The first part is usually the lead-in ("Find the 4 moments when..."), not a moment.

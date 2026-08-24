@@ -27,7 +27,7 @@ def test_the_defaults_are_relative():
 
 
 def test_the_default_data_root_points_at_the_in_repo_link():
-    assert PathConfig().data_root == "data/raw"
+    assert PathConfig().data_root == "data/batch1"
 
 
 def test_generated_output_lives_under_data_processed():
@@ -59,7 +59,7 @@ def test_resolved_leaves_already_absolute_paths_alone(tmp_path):
 def test_resolved_does_not_mutate_the_original(tmp_path):
     paths = PathConfig()
     paths.resolved(tmp_path)
-    assert paths.data_root == "data/raw"
+    assert paths.data_root == "data/batch1"
 
 
 def test_config_resolve_returns_a_copy(tmp_path):
@@ -145,10 +145,10 @@ def test_resolve_false_is_for_writing_a_file_back(tmp_path, monkeypatch):
     """Baking one machine's absolute paths into a shared file is wrong, so it must be avoidable."""
     monkeypatch.delenv("AIC_DATA_ROOT", raising=False)
     config = load_config(resolve=False)
-    assert config.paths.data_root == "data/raw"
+    assert config.paths.data_root == "data/batch1"
     out = config.save(tmp_path / "written.json")
     written = json.loads(out.read_text(encoding="utf-8"))
-    assert written["paths"]["data_root"] == "data/raw"
+    assert written["paths"]["data_root"] == "data/batch1"
 
 
 def test_the_config_file_in_the_repo_matches_the_dataclass(monkeypatch):

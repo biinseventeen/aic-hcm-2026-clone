@@ -143,31 +143,56 @@ def weights_for_query(
     *,
     has_named_entity: bool = False,
     is_visual_only: bool = False,
+    has_translation: bool = False,
     overrides: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
     """Channel weights per query type — the only hyperparameter of P8.
 
-    The defaults are *uncalibrated priors*. They must be tuned on the internal evaluation
-    set (:mod:`aic.eval.devset`) before being trusted.
+    ``has_translation`` switches to the weights measured on the eight labelled queries of round 1,
+    where the translated dense channel ranked the correct video **1st to 3rd on every one of them**
+    while the other four channels ranked it outside the top hundred on seven of the eight. Treating
+    them as near-equals turned a correct first place into a fourth-to-thirteenth, and the
+    allocator
+    then spent its early slots elsewhere: the correct answer ended up at row 51, 71, or off the
+    list entirely.
+    Weighting the translated channel six times the others, and halving the sparse channels, moved
+    mean Final Score on those eight from 0.125 to 0.575 and R@100 from 0.375 to 1.000.
+
+    Without a translation the old, uncalibrated priors stand: the down-weighted sparse channels
+    would otherwise remove signal with nothing put in its place.
     """
     weights = {
         "dense_translated": 1.0,
+        "dense_multilingual": 1.0,
         "dense_original": 0.6,
         "sparse_text": 0.8,
+        # A title match is curated text with no boilerplate, so it earns the highest weight of
+        # any sparse channel: the mock set has queries whose subject is literally the title.
+        "sparse_title": 1.4,
         "entity_fuzzy": 0.7,
     }
+    if has_translation:
+        # Calibrated on 8 labelled queries — enough to see a 4x effect, not enough to separate
+        # neighbouring values. `pi_sharpness` (aic.config) is the other half of this change.
+        weights["dense_translated"] = 6.0
+        weights["sparse_title"] = 0.4
+        weights["sparse_text"] = 0.3
     if has_named_entity:
         # A string match on a rare proper noun is stronger evidence than visual similarity.
         weights["entity_fuzzy"] *= 2.0
         weights["sparse_text"] *= 1.25
+        weights["sparse_title"] *= 1.25
     if is_visual_only:
-        # No textual cue available: the dense channel has to carry the query.
+        # No textual cue available: the dense channels have to carry the query.
         weights["dense_translated"] *= 1.5
+        weights["dense_multilingual"] *= 1.5
         weights["sparse_text"] *= 0.5
+        weights["sparse_title"] *= 0.75
         weights["entity_fuzzy"] *= 0.25
     if kind == "trake":
-        # TRAKE is dominated by Pr(correct video); favour the broadest-coverage channel.
+        # TRAKE is dominated by Pr(correct video); favour the broadest-coverage channels.
         weights["dense_translated"] *= 1.25
+        weights["dense_multilingual"] *= 1.25
     if overrides:
         weights.update(overrides)
     return weights

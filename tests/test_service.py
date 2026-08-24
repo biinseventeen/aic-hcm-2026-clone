@@ -189,3 +189,57 @@ def test_load_fails_when_there_is_no_data(tmp_path):
     cfg = Config().resolve(tmp_path)
     with pytest.raises(FileNotFoundError):
         Engine.load(cfg)
+
+
+def test_pinned_rows_go_to_the_head_and_keep_the_trace_aligned():
+    """A verified answer at slot 29 throws away 0.6 of the 1.0 it earned; pins fix the order."""
+    from aic.core.allocator import Allocation, AllocationTrace
+    from aic.service import Engine
+    from aic.submit.writer import Answer, QuerySubmission
+
+    class Solution:
+        pass
+
+    solution = Solution()
+    solution.submission = QuerySubmission(
+        "p1-19",
+        "qa",
+        [
+            Answer("L27_V001", frame=90, answer="hai câu thơ"),
+            Answer("L27_V004", frame=90, answer="hai câu thơ"),
+        ],
+    )
+    solution.trace = AllocationTrace(
+        allocations=[
+            Allocation(rank=1, video_id="L27_V001", frame_id=90, gain=0.2, cumulative=0.2),
+            Allocation(rank=2, video_id="L27_V004", frame_id=90, gain=0.1, cumulative=0.3),
+        ]
+    )
+    Engine._apply_pins(solution, [("L27_V010", 5535)], task="qa")
+
+    rows = solution.submission.answers
+    assert (rows[0].video_id, rows[0].frame) == ("L27_V010", 5535)
+    assert rows[0].answer == "hai câu thơ", "a pinned Q&A row must carry the answer text"
+    assert len(rows) == 3, "the pinned row is added, the retrieved ones are kept"
+    # to_dict() zips answers with allocations strictly, so the two lists must stay the same length.
+    assert len(solution.trace.allocations) == len(rows)
+    assert solution.trace.allocations[0].source == "pinned"
+    assert [a.rank for a in solution.trace.allocations] == [1, 2, 3]
+
+
+def test_a_pinned_row_already_in_the_list_is_not_duplicated():
+    from aic.core.allocator import Allocation, AllocationTrace
+    from aic.service import Engine
+    from aic.submit.writer import Answer, QuerySubmission
+
+    class Solution:
+        pass
+
+    solution = Solution()
+    solution.submission = QuerySubmission("p1-15", "kis", [Answer("L30_V072", frame=676)])
+    solution.trace = AllocationTrace(
+        allocations=[Allocation(rank=1, video_id="L30_V072", frame_id=676)]
+    )
+    Engine._apply_pins(solution, [("L30_V072", 676)], task="kis")
+    assert len(solution.submission.answers) == 1
+    assert len(solution.trace.allocations) == 1

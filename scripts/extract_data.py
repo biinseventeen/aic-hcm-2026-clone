@@ -245,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--root", default="data/raw", help="the organiser's data directory")
+    parser.add_argument("--root", default="data/batch1", help="the organiser's data directory")
     parser.add_argument("--dest", default=None, help="defaults to <root>/extracted")
     parser.add_argument("--only", action="append", help="restrict to this family (repeatable)")
     parser.add_argument("--dry-run", action="store_true")

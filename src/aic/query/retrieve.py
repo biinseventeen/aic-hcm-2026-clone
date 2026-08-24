@@ -112,7 +112,13 @@ class Retriever:
     dense: DenseIndex
     shots: ShotTable
     text: TextIndex | None = None
+    #: Title-only index — the same BM25 machinery over documents that contain nothing but the
+    #: video title, so a hit can be trusted far more than one in a YouTube description.
+    title: TextIndex | None = None
     encoder: object | None = None
+    #: Second text tower in the same image space, covering Vietnamese directly. Optional: when
+    #: absent the multilingual channel is simply empty and RRF ignores it.
+    encoder_multilingual: object | None = None
     prior: DomainPrior = field(default_factory=DomainPrior)
 
     #: parameters (defaults mirror aic.config.RetrievalConfig)
@@ -121,16 +127,23 @@ class Retriever:
     n_candidates: int = 500
     dedup_cosine: float = 0.92
     max_shots_per_video: int = 12
+    #: highest-IDF query terms kept for BM25; see aic.config.RetrievalConfig.sparse_max_terms.
+    sparse_max_terms: int = 8
+    #: exponent sharpening pi_v; see aic.config.RetrievalConfig.pi_sharpness.
+    pi_sharpness: float = 1.0
 
     # ------------------------------------------------------------------
     # individual channels
     # ------------------------------------------------------------------
 
-    def _dense_channel(self, text: str, name: str) -> ChannelResult:
+    def _dense_channel(
+        self, text: str, name: str, *, encoder: object | None = None
+    ) -> ChannelResult:
         """One dense search. Returns a ranked list of (video, shot_id) keys."""
-        if self.encoder is None:
+        encoder = encoder if encoder is not None else self.encoder
+        if encoder is None:
             return ChannelResult(name=name, ranked=[])
-        query_vector = self.encoder.encode([text])  # type: ignore[union-attr]
+        query_vector = encoder.encode([text])  # type: ignore[union-attr]
         scores, rows = self.dense.search(query_vector, top_k=self.channel_depth)
         ranked: list[tuple[str, int]] = []
         raw: dict[tuple[str, int], float] = {}
@@ -144,41 +157,100 @@ class Retriever:
             raw[key] = float(score)
         return ChannelResult(name=name, ranked=ranked, scores=raw)
 
-    def _sparse_channel(self, query: ParsedQuery, name: str) -> ChannelResult:
-        if self.text is None or not query.keywords:
+    def _sparse_channel(
+        self,
+        query: ParsedQuery,
+        name: str,
+        *,
+        index: TextIndex | None = None,
+        query_vector: np.ndarray | None = None,
+    ) -> ChannelResult:
+        index = index if index is not None else self.text
+        if index is None or not query.keywords:
             return ChannelResult(name=name, ranked=[])
         text = " ".join(query.keywords) or query.raw
-        hits = self.text.search_bm25(text, top_k=self.channel_depth)
-        return self._text_hits_to_channel(hits, name)
+        hits = index.search_bm25(text, top_k=self.channel_depth, max_terms=self.sparse_max_terms)
+        return self._text_hits_to_channel(hits, name, index=index, query_vector=query_vector)
 
-    def _entity_channel(self, query: ParsedQuery, name: str) -> ChannelResult:
+    def _entity_channel(
+        self, query: ParsedQuery, name: str, *, query_vector: np.ndarray | None = None
+    ) -> ChannelResult:
         if self.text is None or not query.entities:
             return ChannelResult(name=name, ranked=[])
         hits = self.text.search_fuzzy(query.entities, top_k=self.channel_depth)
-        return self._text_hits_to_channel(hits, name)
+        return self._text_hits_to_channel(hits, name, query_vector=query_vector)
 
-    def _text_hits_to_channel(self, hits: list[tuple[int, float]], name: str) -> ChannelResult:
+    def _shots_for_video_level_hit(
+        self, video_id: str, query_vector: np.ndarray | None
+    ) -> list[int]:
+        """Which shots of a video a *video-level* text hit should stand for.
+
+        This function exists because of a measured, catastrophic failure. The first version took
+        ``shots.of(video_id)[:max_shots_per_video]`` — the **first twelve shots**, which in this
+        corpus is the series title sequence. Every episode of a series shares that sequence, so a
+        BM25 hit on any episode contributed a handful of interchangeable intro shots, and the
+        allocator, seeing high-scoring candidates in many different videos, spread its slots
+        across them. Counted on the first scored submission: **37 % of all 2,400 submitted rows
+        fell within the first five seconds of their video**, and the most frequent frame ids were
+        177, 89, 94, 43, 32 — credits, not content. The correct video for one query sat at rank 3
+        with its frame inside the intro, which scores exactly zero.
+
+        A text hit says *which video*; the dense index says *where inside it*. So the shots are
+        ranked by the best cosine any of their keyframes reaches against the query vector. With no
+        query vector (no encoder), the fallback is an **even spread** across the whole video —
+        still wrong, but wrong in a way that does not concentrate on the one shot every video
+        shares.
+        """
+        shots = self.shots.of(video_id)
+        if not shots:
+            return []
+        limit = self.max_shots_per_video
+        if query_vector is None:
+            step = max(1, len(shots) // limit)
+            return [shot.shot_id for shot in shots[::step]][:limit]
+
+        rows = self.dense.video_rows(video_id)
+        if rows.size == 0:
+            step = max(1, len(shots) // limit)
+            return [shot.shot_id for shot in shots[::step]][:limit]
+        vectors = np.asarray(self.dense.vectors[rows], dtype=np.float32)
+        sims = vectors @ np.asarray(query_vector, dtype=np.float32).ravel()
+        best: dict[int, float] = {}
+        for row, sim in zip(rows.tolist(), sims.tolist(), strict=True):
+            _video, _n, frame = self.dense.decode(int(row))
+            shot = self.shots.find(video_id, frame)
+            shot_id = shot.shot_id if shot else frame
+            if sim > best.get(shot_id, -2.0):
+                best[shot_id] = sim
+        return [shot_id for shot_id, _ in sorted(best.items(), key=lambda kv: -kv[1])[:limit]]
+
+    def _text_hits_to_channel(
+        self,
+        hits: list[tuple[int, float]],
+        name: str,
+        *,
+        index: TextIndex | None = None,
+        query_vector: np.ndarray | None = None,
+    ) -> ChannelResult:
         """Convert document-level hits into (video, shot_id) keys.
 
         ``media-info`` documents are *video*-level: they do not say which shot holds the event.
-        Their score is spread across **every** shot of the video, preserving the video ordering.
-        That is the right behaviour for a retrieval channel: it says "this video is worth
-        looking at", and choosing the shot is the job of the dense channel and the verification
-        layer.
+        Which shots the hit stands for is decided by :meth:`_shots_for_video_level_hit`.
         """
-        if self.text is None:
+        index = index if index is not None else self.text
+        if index is None:
             return ChannelResult(name=name, ranked=[])
         ranked: list[tuple[str, int]] = []
         raw: dict[tuple[str, int], float] = {}
         for doc_id, score in hits:
-            doc = self.text.docs[doc_id]
+            doc = index.docs[doc_id]
             video_id = doc.video_id
             if doc.is_video_level:
-                shots = self.shots.of(video_id)[: self.max_shots_per_video]
-                if not shots:
+                shot_ids = self._shots_for_video_level_hit(video_id, query_vector)
+                if not shot_ids:
                     continue
-                for shot in shots:
-                    key = (video_id, shot.shot_id)
+                for shot_id in shot_ids:
+                    key = (video_id, shot_id)
                     if key not in raw:
                         ranked.append(key)
                         raw[key] = float(score)
@@ -209,13 +281,34 @@ class Retriever:
             channels.append(self._dense_channel(dense_texts[1], "dense_original"))
         else:
             channels.append(self._dense_channel(dense_texts[0], "dense_original"))
-        channels.append(self._sparse_channel(query, "sparse_text"))
-        channels.append(self._entity_channel(query, "entity_fuzzy"))
+        # A second dense channel over the *same* raw Vietnamese text, through a text tower that
+        # was distilled to land in this image space from any of 50 languages. It is not a
+        # replacement for the channel above: on the mock set each tower finds videos the other
+        # misses entirely, which is exactly the case RRF exists for.
+        if self.encoder_multilingual is not None:
+            channels.append(
+                self._dense_channel(
+                    query.raw, "dense_multilingual", encoder=self.encoder_multilingual
+                )
+            )
+        # One query vector, reused by every text channel to place its video-level hits.
+        query_vector = None
+        if self.encoder is not None:
+            query_vector = np.asarray(self.encoder.encode([query.raw]), dtype=np.float32).ravel()
+        channels.append(self._sparse_channel(query, "sparse_text", query_vector=query_vector))
+        if self.title is not None:
+            channels.append(
+                self._sparse_channel(
+                    query, "sparse_title", index=self.title, query_vector=query_vector
+                )
+            )
+        channels.append(self._entity_channel(query, "entity_fuzzy", query_vector=query_vector))
 
         channel_weights = weights or weights_for_query(
             query.task,
             has_named_entity=bool(query.entities),
             is_visual_only=not (query.entities or query.keywords),
+            has_translation=bool(query.english),
         )
         for channel in channels:
             channel.weight = channel_weights.get(channel.name, 1.0)
@@ -282,6 +375,12 @@ class Retriever:
             )
             for video_id, scores in by_video.items()
         }
+        if self.pi_sharpness != 1.0:
+            # Monotone, so no ranking changes: this only decides how much mass the leaders hold,
+            # and therefore how many slots the allocator commits before hedging.
+            aggregated = {
+                video_id: score**self.pi_sharpness for video_id, score in aggregated.items()
+            }
         total = sum(aggregated.values())
         normalised = (
             {video_id: score / total for video_id, score in aggregated.items()}

@@ -20,6 +20,14 @@ stays visible which assumption a result rests on:
 Automatic fuzzy matching is deliberately *not* used for answers: "màu xanh" and "màu xám" are
 close in characters but are two different answers, and an over-permissive scorer makes every
 internal number optimistic in a way that looks correct — the worst failure mode in a tuning loop.
+
+Which tier the real scoring system uses is **not settled**. The result specification says the
+answer is compared "chính xác về mặt ngữ nghĩa" (semantically) in its Q&A section and "dưới dạng
+chuỗi chính xác" (as an exact string) in its closing notes. The three tiers here implement the
+*generous* reading, so every Q&A number this module reports is an **upper bound**: under the strict
+reading only the ``exact`` tier scores, and the ``numeric`` and ``alias`` hits become zero. The
+tier is recorded per query for exactly that reason — subtracting the non-``exact`` hits gives the
+pessimistic number without re-running anything. See ``docs/SUBMISSION.md`` §2, question 1.
 """
 
 from __future__ import annotations

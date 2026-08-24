@@ -32,6 +32,7 @@ engine behind a queue or a small pool rather than allowing unbounded concurrency
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -204,7 +205,11 @@ class Engine:
     dense: Any
     shots: Any
     text: Any | None
+    #: optional title-only sparse index; absent until ``build-index`` has been re-run.
+    title: Any | None
     encoder: Any | None
+    #: optional second text tower (multilingual), in the same image space as ``encoder``.
+    encoder_multilingual: Any | None
     retriever: Any
     fps: dict[str, float]
     max_frames: dict[str, int]
@@ -256,6 +261,11 @@ class Engine:
                 warnings.append(
                     f"{text_path.name} is missing — the sparse and entity channels will be silent"
                 )
+        title = None
+        title_path = Path(cfg.paths.index_dir) / "text_title.json"
+        if title_path.exists():
+            title = TextIndex.load(title_path, with_fuzzy=False)
+
         encoder = None
         if need_encoder:
             encoder = load_text_encoder(
@@ -267,6 +277,24 @@ class Engine:
                     "submission"
                 )
 
+        # The multilingual tower is a bonus channel, never a requirement: if it cannot be loaded
+        # the system degrades to exactly the behaviour it had before, so a failure here is a
+        # warning rather than an error.
+        encoder_multilingual = None
+        if need_encoder and cfg.text_encoder_multilingual and not allow_stub:
+            try:
+                encoder_multilingual = load_text_encoder(
+                    cfg.text_encoder_multilingual, expect_dim=dense.dim, verbose=False
+                )
+                if is_stub(encoder_multilingual):
+                    encoder_multilingual = None
+            except Exception as exc:
+                encoder_multilingual = None
+                warnings.append(
+                    f"multilingual text tower unavailable ({type(exc).__name__}); running with "
+                    "the English tower alone, which does not read Vietnamese prose well"
+                )
+
         retrieval = cfg.retrieval
         engine = cls(
             cfg=cfg,
@@ -275,20 +303,26 @@ class Engine:
             dense=dense,
             shots=shots,
             text=text,
+            title=title,
             encoder=encoder,
+            encoder_multilingual=encoder_multilingual,
             fps={video_id: table.fps for video_id, table in tables.items()},
             max_frames={video_id: table.duration_frames for video_id, table in tables.items()},
             retriever=Retriever(
                 dense=dense,
                 shots=shots,
                 text=text,
+                title=title,
                 encoder=encoder,
+                encoder_multilingual=encoder_multilingual,
                 prior=DomainPrior(),
                 channel_depth=retrieval.channel_depth,
                 rrf_eta=retrieval.rrf_eta,
                 n_candidates=retrieval.n_candidates,
                 dedup_cosine=retrieval.dedup_cosine,
                 max_shots_per_video=retrieval.max_shots_per_video,
+                sparse_max_terms=retrieval.sparse_max_terms,
+                pi_sharpness=retrieval.pi_sharpness,
             ),
             warnings=warnings,
         )
@@ -325,10 +359,15 @@ class Engine:
 
     # -- solving -----------------------------------------------------------
 
-    def parse(self, text: str, *, task_hint: TaskName | None = None):
+    def parse(self, text: str, *, task_hint: TaskName | None = None, english: str = ""):
         from .query.parse import parse_query
 
-        return parse_query(text, task_hint=task_hint)
+        query = parse_query(text, task_hint=task_hint)
+        if english:
+            # Fills the dense_translated channel. The raw query keeps its own channel either way,
+            # so a bad translation degrades this run rather than replacing what worked.
+            query.english = english
+        return query
 
     def solve(
         self,
@@ -337,8 +376,23 @@ class Engine:
         query_id: str = "1",
         task_hint: TaskName | None = None,
         hedge_answers: bool = True,
+        answers: Sequence[tuple[str, float]] | None = None,
+        pins: Sequence[tuple[str, int]] | None = None,
+        english: str = "",
     ) -> SolveResult:
         """Solve one query, from raw text to 100 ordered answers.
+
+        ``answers`` supplies Q&A answer hypotheses as ``(text, probability)`` pairs. Until a VQA
+        model exists (G5) this is the *only* source of a real answer, and the answer axis is one
+        of the three conjuncts a Q&A row is scored on: without it the row cannot score, however
+        good the retrieval. Ignored for KIS and TRAKE.
+
+        ``pins`` are ``(video_id, frame_id)`` pairs a human has **verified** by looking at the
+        frame. They are placed at the head of the answer list, before everything the retrieval
+        layer proposed. This is not a shortcut around retrieval: slot 1 alone is worth a fifth of
+        a query's score, and a verified answer sitting at slot 29 — which is where the one
+        annotated Q&A query landed — throws away 0.6 of the 1.0 it had already earned. Ignored
+        for TRAKE, whose rows need N frames rather than one.
 
         Raises :class:`ValueError` when a TRAKE query yields no moments — that is an input error,
         not a system error, so a backend should map it to a 4xx response.
@@ -348,7 +402,7 @@ class Engine:
         from .tasks.trake import solve_trake, windows_from_keyframes
 
         started = time.perf_counter()
-        query = self.parse(text, task_hint=task_hint)
+        query = self.parse(text, task_hint=task_hint, english=english)
         retrieval = self.retriever.retrieve(query)
         retrieval.candidates = self.retriever.cluster_near_duplicates(retrieval.candidates)
 
@@ -367,11 +421,18 @@ class Engine:
                 max_frames=self.max_frames,
             )
         elif query.task == "qa":
-            # No VQA model yet: a single neutral hypothesis keeps the pipeline running. The
-            # answer score will be zero — a GPU-dependent item, see docs/CONSTRAINTS.md G5.
-            hypotheses = [AnswerHypothesis("(no VQA model available)", 1.0, "placeholder")]
-            notes.append("no VQA model: the Q&A answer axis always scores zero (G5)")
-            degraded = True
+            if answers:
+                hypotheses = [
+                    AnswerHypothesis(text, prob, "supplied") for text, prob in answers if text
+                ]
+            else:
+                # No VQA model and nothing supplied: a neutral hypothesis keeps the pipeline
+                # running, but the answer axis then scores zero whatever the retrieval does.
+                hypotheses = [AnswerHypothesis("(no VQA model available)", 1.0, "placeholder")]
+                notes.append(
+                    "no VQA model and no supplied answer: the answer axis scores zero (G5)"
+                )
+                degraded = True
             solution = solve_qa(
                 query_id,
                 retrieval,
@@ -408,6 +469,10 @@ class Engine:
             )
             degraded = True
 
+        if pins and query.task != "trake":
+            self._apply_pins(solution, pins, task=query.task)
+            notes.append(f"{len(pins)} human-verified answer(s) pinned to the head of the list")
+
         return SolveResult(
             query_id=query_id,
             task=query.task,
@@ -421,6 +486,52 @@ class Engine:
             degraded=degraded,
             notes=notes,
         )
+
+    @staticmethod
+    def _apply_pins(solution, pins: Sequence[tuple[str, int]], *, task: TaskName) -> None:
+        """Move verified ``(video, frame)`` rows to the front, keeping the list at 100 rows.
+
+        The trace is rewritten alongside the answers because ``SolveResult.to_dict`` pairs the two
+        strictly; a pinned row carries ``source="pinned"`` so a report still shows where it came
+        from, with gain 0 (a pin is evidence, not a model prediction).
+        """
+        from .core.allocator import Allocation
+        from .core.objective import MAX_ANSWERS
+        from .submit.writer import Answer
+
+        existing = solution.submission.answers
+        # For Q&A every pinned frame is submitted with the strongest answer hypothesis, which is
+        # whatever the first row already carries.
+        answer_text = existing[0].answer if task == "qa" and existing else None
+        head: list[Answer] = []
+        for video_id, frame in pins:
+            head.append(Answer(video_id=video_id, frame=int(frame), answer=answer_text))
+        seen = {(a.video_id, a.frame, a.answer) for a in head}
+        tail = [a for a in existing if (a.video_id, a.frame, a.answer) not in seen]
+        merged = (head + tail)[:MAX_ANSWERS]
+        solution.submission.answers = merged
+        allocations = []
+        for rank, answer in enumerate(merged, start=1):
+            if rank <= len(head):
+                allocations.append(
+                    Allocation(
+                        rank=rank, video_id=answer.video_id, frame_id=answer.frame, source="pinned"
+                    )
+                )
+            else:
+                previous = solution.trace.allocations[rank - len(head) - 1]
+                allocations.append(
+                    Allocation(
+                        rank=rank,
+                        video_id=answer.video_id,
+                        frame_id=answer.frame,
+                        answer=answer.answer,
+                        gain=previous.gain,
+                        cumulative=previous.cumulative,
+                        source=previous.source,
+                    )
+                )
+        solution.trace.allocations = allocations
 
     # -- writing submissions -----------------------------------------------
 

@@ -219,7 +219,7 @@ class DataRoot:
     """The directory holding all organiser-supplied data.
 
     Defaults to the ``AIC_DATA_ROOT`` environment variable. In this repository the configured
-    default is the ``data/raw`` link created by ``scripts/link_data.py``.
+    default is the ``data/batch1`` link created by ``scripts/link_data.py``.
     """
 
     root: Path
@@ -237,7 +237,7 @@ class DataRoot:
             )
 
     @classmethod
-    def from_env(cls, default: str = "data/raw", **kwargs) -> DataRoot:
+    def from_env(cls, default: str = "data/batch1", **kwargs) -> DataRoot:
         return cls(Path(os.environ.get("AIC_DATA_ROOT", default)), **kwargs)
 
     def _glob(self, pattern: str) -> list[Path]:

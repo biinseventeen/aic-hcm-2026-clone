@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--root", default=None, help="defaults to <project root>/data/raw")
+    parser.add_argument("--root", default=None, help="defaults to <project root>/data/batch1")
     parser.add_argument("--dest", default=None, help="defaults to <root>/extracted")
     parser.add_argument("--yes", action="store_true", help="actually delete")
     parser.add_argument(
@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     enable_utf8_stdio()
 
-    root = Path(args.root) if args.root else find_project_root() / "data" / "raw"
+    root = Path(args.root) if args.root else find_project_root() / "data" / "batch1"
     if not root.is_dir():
         print(f"data directory not found: {root}", file=sys.stderr)
         return 2

@@ -1,0 +1,81 @@
+{
+  "_about": [
+    "Rows verified by opening the keyframe and reading it. Input to: aic run --pins.",
+    "A pin claims only what was seen in that frame; nothing here is a model prediction.",
+    "Three frames per pin: the keyframe itself plus its neighbours, because the organisers' answer",
+    "span is unknown (CONSTRAINTS R3) and a single frame bets everything on one guess about it."
+  ],
+  "p1-15": [
+    {
+      "video_id": "L30_V072",
+      "frame": 676,
+      "why": "kf 009 — event banner: Xã Giang Ly, huyện Khánh Vĩnh, tỉnh Khánh Hoà"
+    },
+    {
+      "video_id": "L30_V072",
+      "frame": 1776,
+      "why": "kf 035 — the same banner, second appearance"
+    },
+    {
+      "video_id": "L30_V072",
+      "frame": 1792,
+      "why": "kf 036 — banner still on screen"
+    }
+  ],
+  "p1-19": [
+    {
+      "video_id": "L27_V010",
+      "frame": 5535,
+      "why": "kf 146 — both lines of the couplet fully legible beside the bust"
+    },
+    {
+      "video_id": "L27_V010",
+      "frame": 5474,
+      "why": "kf 145 — same shot, couplet partly framed"
+    },
+    {
+      "video_id": "L27_V010",
+      "frame": 5597,
+      "why": "kf 147 — end of the same shot"
+    }
+  ],
+  "p1-22": [
+    {
+      "video_id": "L30_V078",
+      "frame": 1848,
+      "why": "kf 031 — recipe sheet titled 'Nhân bánh cuốn', 200 gr nạc dăm xay"
+    },
+    {
+      "video_id": "L30_V078",
+      "frame": 1893,
+      "why": "kf 032 — same scene, sheet still held up"
+    }
+  ],
+  "p1-20": [
+    {
+      "video_id": "L26_V004",
+      "frame": 476,
+      "why": "kf 014 - finished plate: 3 glasses, grape slices, mint, two edible flowers"
+    },
+    {
+      "video_id": "L26_V004",
+      "frame": 405,
+      "why": "kf 013 - hand placing the third glass"
+    },
+    {
+      "video_id": "L26_V004",
+      "frame": 361,
+      "why": "kf 012 - hand placing the third glass, earlier"
+    },
+    {
+      "video_id": "L26_V004",
+      "frame": 540,
+      "why": "kf 015 - same plate under the title card"
+    },
+    {
+      "video_id": "L26_V004",
+      "frame": 300,
+      "why": "kf 011 - two glasses before the third arrives"
+    }
+  ]
+}

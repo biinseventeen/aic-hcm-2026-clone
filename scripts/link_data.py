@@ -1,12 +1,12 @@
-"""Point ``data/raw`` at the organiser's corpus with a link, not a copy.
+"""Point ``data/batch1`` at the organiser's corpus with a link, not a copy.
 
 Basis
 -----
 The corpus is ~107 GiB compressed plus ~30.5 GiB extracted; it cannot live inside the source tree
 and it cannot be copied. But every path in ``configs/default.json`` should be *relative to the
 project root* — that is the condition for one configuration to work on a development machine, in a
-container, and inside a backend process. A link at ``data/raw`` satisfies both: the configuration
-says ``data/raw``, and the link is the single place that knows where the data actually is.
+container, and inside a backend process. A link at ``data/batch1`` satisfies both: the configuration
+says ``data/batch1``, and the link is the single place that knows where the data actually is.
 
     python scripts/link_data.py                     # use the default paths
     python scripts/link_data.py --target E:/AIC     # corpus stored elsewhere
@@ -141,14 +141,14 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("AIC_DATA_TARGET", DEFAULT_TARGET),
         help=f"the real corpus directory (default {DEFAULT_TARGET})",
     )
-    parser.add_argument("--link", default=None, help="defaults to <project root>/data/raw")
+    parser.add_argument("--link", default=None, help="defaults to <project root>/data/batch1")
     parser.add_argument("--check", action="store_true", help="check only, create nothing")
     parser.add_argument("--force", action="store_true", help="replace an existing link")
     args = parser.parse_args(argv)
     enable_utf8_stdio()
 
     root = find_project_root()
-    link = Path(args.link) if args.link else root / "data" / "raw"
+    link = Path(args.link) if args.link else root / "data" / "batch1"
     target = Path(args.target).resolve()
 
     print(f"project root: {root}")

@@ -1,30 +1,31 @@
 """Generating and validating submission files.
 
-Separating specification from assumption
-========================================
-The document "Thông tin vòng Sơ tuyển AIC2026" specifies the *content* of an answer (section
-2.1) but **not** the file format, the naming, or the packaging. What the rules state for
-certain:
+What the organisers specify
+===========================
+The published result specification ("Yêu cầu kết quả") settles the file format, not only the
+answer content. Everything below is **stated**, not assumed:
 
-* at most **100** answers per query (section 2);
-* Textual KIS: ``<video_id>, <frame_id>``;
-* Q&A: ``<video_id>, <frame_id>, <answer>``;
-* TRAKE: ``<video_id>, <frame_id_1>, ..., <frame_id_N>``;
-* row **order** is decisive — R@k reads by position.
+* one ``.csv`` file per query — a real text file, never a spreadsheet — of at most **100** rows;
+* Textual KIS: ``<video_id>,<frame_id>``;
+* Q&A: ``<video_id>,<frame_id>,<answer>``, the answer at most **100 characters**;
+* TRAKE: ``<video_id>,<frame_id_1>,...,<frame_id_N>``, exactly ``N`` frames in temporal order;
+* row **order** is decisive — R@k reads by position;
+* UTF-8, comma delimiter, **no** header row, CRLF or LF both accepted;
+* quoting only where the field needs it: a comma, a quote (doubled) or a newline inside an
+  answer. Leading and trailing whitespace is **preserved, not trimmed**, so a stray space
+  changes the answer;
+* ``video_id`` carries **no** ``.mp4`` extension;
+* ``frame_id`` is compared as an integer;
+* the archive is a ``.zip`` containing a **``submission/`` directory** which holds the CSV
+  files. Zipping the files directly, with no directory, is explicitly wrong.
 
-What this module *assumes*, following the convention of previous AIC seasons, and what
-**must be confirmed with the organisers**:
+One statement in that document contradicts itself: the Q&A section says the answer is compared
+"chính xác về mặt ngữ nghĩa" (semantically), while the closing notes say "so sánh dưới dạng
+chuỗi chính xác" (as an exact string). This module does not need to resolve it — but
+``aic.eval.score`` does, and the strategy in ``docs/SUBMISSION.md`` §4.3 depends on it.
 
-* one CSV file per query, with **no** header row;
-* the filename ``query-<id>-<task>.csv`` (``kis`` | ``qa`` | ``trake``);
-* the files are packaged in a single flat .zip;
-* ``video_id`` is written **without** the ``.mp4`` extension (the rules write
-  ``video_abc(.mp4)``, meaning the extension is optional — the bare form matches the keyframe
-  directory names and the metadata filenames, so that is the form chosen).
-
-Pass ``naming=SubmissionNaming(...)`` to change any of the above without touching code. Run
-``aic submit-selftest`` to print a complete set of sample files to send to the organisers for
-confirmation before submitting for real.
+Pass ``naming=SubmissionNaming(...)`` to change any format decision without touching code. Run
+``aic submit-selftest`` to print a complete set of sample files.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from ..core.objective import MAX_ANSWERS
 from ..data.layout import VIDEO_ID_RE
 
 __all__ = [
+    "MAX_ANSWER_CHARS",
     "Answer",
     "QuerySubmission",
     "SubmissionNaming",
@@ -54,14 +56,14 @@ __all__ = [
 
 Task = Literal["kis", "qa", "trake"]
 
-#: An answer longer than this is flagged. A long answer is more likely to be judged a
-#: non-match, since the rules only require semantic equivalence with a short ground truth.
-MAX_REASONABLE_ANSWER_CHARS = 200
+#: Hard limit stated by the result specification: a Q&A answer is at most 100 characters. Over
+#: the limit the row is invalid, so this is an error rather than a warning.
+MAX_ANSWER_CHARS = 100
 
 
 @dataclass(slots=True)
 class SubmissionNaming:
-    """Every format assumption, in one place, so each is a one-line change."""
+    """Every format decision, in one place, so each is a one-line change."""
 
     #: filename template; available keys are query_id and task.
     filename: str = "query-{query_id}-{task}.csv"
@@ -69,10 +71,14 @@ class SubmissionNaming:
     include_header: bool = False
     #: when set, write ``L21_V001.mp4`` instead of ``L21_V001``.
     video_extension: str = ""
-    #: line terminator; CRLF is the safe default for CSV readers on Windows and in Excel.
+    #: line terminator; the specification accepts CRLF or LF, and CRLF is the safer of the two
+    #: for readers on Windows.
     lineterminator: str = "\r\n"
     encoding: str = "utf-8"
     zip_name: str = "submission.zip"
+    #: directory inside the archive. The specification requires the CSV files to sit inside a
+    #: ``submission/`` directory; an empty string produces a flat archive instead.
+    zip_dir: str = "submission"
 
     def file_for(self, query_id: str, task: Task) -> str:
         return self.filename.format(query_id=query_id, task=task)
@@ -201,11 +207,25 @@ def validate(
             if answer.answer is None or not answer.answer.strip():
                 add("error", "Q&A answer is missing", row_number)
             elif "\n" in answer.answer or "\r" in answer.answer:
+                # The specification permits a newline inside a quoted field, and csv writes it
+                # correctly. It stays an error here because no answer within the 100-character
+                # limit needs one, while every reader of the file — including our own read-back
+                # parser — becomes harder to trust.
                 add("error", "answer contains a newline — it would break the CSV", row_number)
-            elif len(answer.answer) > MAX_REASONABLE_ANSWER_CHARS:
+            elif len(answer.answer) > MAX_ANSWER_CHARS:
+                add(
+                    "error",
+                    f"answer is {len(answer.answer)} characters, over the {MAX_ANSWER_CHARS} "
+                    "the specification allows",
+                    row_number,
+                )
+            elif answer.answer != answer.answer.strip():
+                # Whitespace is preserved, not trimmed, and the comparison may be exact-string:
+                # " Màu đỏ" and "Màu đỏ" are then two different answers.
                 add(
                     "warning",
-                    "answer is very long; long answers are easily judged a non-match",
+                    f"answer has leading or trailing whitespace: {answer.answer!r} — it is "
+                    "preserved, not trimmed",
                     row_number,
                 )
         if submission.task == "trake":
@@ -287,25 +307,38 @@ def write_submission(
     return path, issues
 
 
-def package_submission(files: Iterable[str | Path], out_zip: str | Path) -> Path:
-    """Package submission files into a **flat** .zip, with no nested directory.
+def package_submission(
+    files: Iterable[str | Path],
+    out_zip: str | Path,
+    *,
+    naming: SubmissionNaming | None = None,
+) -> Path:
+    """Package submission files into a ``.zip`` holding a ``submission/`` directory.
 
-    A flat structure is the safest form: if the scoring system expects a subdirectory it will
-    usually still find the files, whereas the reverse does not hold.
+    The result specification is explicit about this: the archive must contain a directory named
+    ``submission`` with the CSV files inside it, and zipping the CSV files directly is wrong.
+    The directory name is ``naming.zip_dir``; setting it to ``""`` produces a flat archive.
     """
+    naming = naming or SubmissionNaming()
     out = Path(out_zip)
     out.parent.mkdir(parents=True, exist_ok=True)
     paths = [Path(file) for file in files]
     missing = [path for path in paths if not path.exists()]
     if missing:
         raise FileNotFoundError(f"missing files to package: {missing[:5]}")
+    prefix = naming.zip_dir.strip("/")
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(paths):
-            archive.write(path, arcname=path.name)
+            archive.write(path, arcname=f"{prefix}/{path.name}" if prefix else path.name)
     return out
 
 
-_FILENAME_RE = re.compile(r"^query-(?P<query_id>[^-]+)-(?P<task>kis|qa|trake)\.csv$")
+#: The query id itself contains hyphens in the sets the organisers publish — their own query
+#: files are named ``query-p1-18-trake.txt`` — so the id is matched greedily and only the task
+#: suffix is anchored. Restricting the id to one hyphen-free segment made every real filename
+#: fall through to the "does not match" warning, and ``validate_submission_dir`` then skipped
+#: the file entirely: the last gate before submitting validated nothing.
+_FILENAME_RE = re.compile(r"^query-(?P<query_id>.+)-(?P<task>kis|qa|trake)\.csv$")
 
 #: Minimum column count per task, used by the defensive re-read parser.
 _MIN_COLUMNS: dict[str, int] = {"kis": 2, "qa": 3, "trake": 2}

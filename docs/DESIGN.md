@@ -556,6 +556,28 @@ mangles a query, the raw channel is still intact. The cost is one extra vector s
 | `RuleParser` | Task classification, entity extraction, negation extraction, moment splitting, domain hints | Translation into English |
 | LLM callable | Better translation and better TRAKE moment splitting | Determinism; it needs an external API |
 
+**Measured on the published mock set: the missing translation was the largest single loss in the
+system, and it is now routed around rather than fixed.** Embedding the raw Vietnamese with a text
+tower trained on English left two of three verifiable targets unreachable — video-rank *beyond 4,000
+vectors*, against rank 1 and rank 2 for an English paraphrase of the same query. Rather than adding a
+translation step (an external API, a new failure mode, per-query latency), a **second text tower
+distilled into the same image space** runs as its own channel (P8). Neither tower dominates: the
+English one puts the panna-cotta video at video-rank 5 where the multilingual one puts it at 564, and
+the multilingual one puts the charity-club video at rank 1 where the English one never finds it.
+Keeping both is the same argument as keeping the raw query as its own channel.
+
+**Moment labels are read, not guessed.** The organisers write TRAKE moments as `E1:`, `E2:` on their
+own lines. The heuristic splitter looked for `(1)`, `1.` and `bước 1:`, found fewer than two moments,
+and every TRAKE query in the published set fell through to the KIS branch — wrong task, wrong file,
+wrong column count. Labelled moments now take precedence, and the label *values* are not trusted: one
+published query is numbered `E1, E2, E2, E4` and still has four moments.
+
+**The instruction frame is not content.** Queries arrive wrapped in phrasing shared by almost every
+query ("Đoạn clip cần tìm là cảnh…", "Hãy tìm chính xác phân cảnh…"). Those words must not reach the
+sparse channel, and IDF cannot remove them: descriptions in `media-info` never say "đoạn clip", so
+they are *rare in the corpus* and score a **high** IDF. Corpus IDF measures rarity, not
+informativeness. `QUERY_FRAME_WORDS` filters them on the query side only, never at index time.
+
 The rule result is *always* kept as the base; the LLM may only **add** to it, never overwrite a field
 the rules already know for certain. If the LLM call fails, the parser degrades to rules rather than
 failing the query.
@@ -581,21 +603,31 @@ the verification layer (P9).
 **This stage sets the ceiling on $P_{100}$.** An answer that does not reach the candidate set is lost
 permanently; no later stage can recover it.
 
-Four channels run in parallel and are fused with RRF:
+Five channels run in parallel and are fused with RRF:
 
-| Channel | Input | Index unit |
-|---|---|---|
-| `dense_translated` | The English translation | keyframe |
-| `dense_original` | The raw Vietnamese query | keyframe |
-| `sparse_text` | Keywords, via BM25 | video / shot |
-| `entity_fuzzy` | Entities, via character n-grams | video / shot |
+| Channel | Input | Index unit | Weight |
+|---|---|---|---|
+| `dense_original` | Raw Vietnamese query, English text tower | keyframe | 0.6 |
+| `dense_multilingual` | Raw Vietnamese query, multilingual tower in the same image space | keyframe | 1.0 |
+| `sparse_title` | Pruned query terms against **titles only**, BM25 | video / shot | 1.4 |
+| `sparse_text` | Pruned query terms against title + description + keywords, BM25 | video / shot | 0.8 |
+| `entity_fuzzy` | Entities, character n-grams | video / shot | 0.7 |
+
+`dense_translated` stays defined for a future translation step and is empty while P7 does not
+translate. The weights are uncalibrated priors (R3): with 3 of 24 queries labelled they can be
+reasoned about but not yet tuned.
 
 **Why RRF, and why union.** RRF consumes only *ranks*, never scores, so it is invariant to each
 channel's score scale shifting as the corpus grows (constraint R5) — weights tuned on batch 1 still
 mean something on batch 1+2. Union guarantees no channel holds a veto: a query where the visual channel
-fails completely can still be rescued by OCR, and the reverse. With four channels at recall
-$r_1..r_4$, the fused recall is $1 - \prod(1 - r_i)$ under independence — four channels at 0.6 each
-give 0.974, whereas their intersection gives 0.13.
+fails completely can still be rescued by OCR, and the reverse. With $n$ channels at recall
+$r_1..r_n$, the fused recall is $1 - \prod(1 - r_i)$ under independence — five channels at 0.6 each
+give 0.990, whereas their intersection gives 0.08.
+
+That arithmetic assumes independence, and the two dense channels are the case where it is weakest:
+they read the same query into the same image space through different text towers. Measured, they
+disagree far more than that framing suggests — each finds videos the other misses entirely (P7) —
+which is what justifies paying for both rather than picking the better one.
 
 **Two mechanisms this stage requires.**
 
@@ -612,6 +644,48 @@ its own.
 **A known noise source.** `media-info` is video-level text, so a BM25 hit says "this video is
 relevant", not "this shot is". The score has to be spread across the shots of the video, which is
 imprecise by construction. It only goes away once P4 and P5 exist at shot granularity.
+
+**A second noise source, measured on the submitted files: topically broad videos captured the most
+valuable slots.** Counted over the 24 files of the first real submission, one travel-show episode
+held **slot 1 of four queries** and appeared in the top 5 of **nine**; the six worst offenders were
+all episodes of the same series. Slot 1 alone is worth a fifth of a query's score, which made this
+the most expensive defect in the retrieval layer. Two causes, both structural rather than
+statistical:
+
+1. *BM25 ran on the whole query* — roughly 24 terms, most of them instruction phrasing or generic
+   description, which favours whichever document covers the widest range of topics. The query is now
+   pruned to its 8 highest-IDF terms (`retrieval.sparse_max_terms`) after the frame words of P7 are
+   removed. On the three verifiable queries this moves the correct video to BM25 rank 1.
+2. *Title and description were one document.* A hit on a curated title is near-certain evidence; a
+   hit inside a subscribe-link wall is close to none. Concatenated they are indistinguishable, and
+   the fusion layer can only weight the mixture. Titles are now their own index and their own
+   channel, weighted 1.4 against 0.8.
+
+Effect of those two plus the multilingual tower of P7, on the videos whose identity is verifiable:
+slot 26 → 3 and slot 10 → 3, with the worst magnet down from 9 of 24 top-5s to 4.
+
+**The defect that dominated everything above: a video-level hit was expanded into the video's title
+sequence.** `media-info` is video-level text, so a BM25 hit has to be turned into shots. The first
+implementation took `shots.of(video_id)[:max_shots_per_video]` — the **first twelve shots**, which in
+this corpus is the series intro. Every episode of a series shares it, so a hit on any episode
+contributed a handful of interchangeable credit shots, and the allocator, seeing high-scoring
+candidates spread across many videos, distributed slots over them. Measured on the first scored
+submission:
+
+| | Before | After |
+|---|---|---|
+| Submitted rows inside the first 5 s of their video | **37.0 %** (889 of 2,400) | **2.4 %** |
+| Most frequent submitted frame ids | 177, 89, 94, 43, 32 | 239, 268, 296, 235, 158 |
+| Correct video for `p1-20`, and its frame | rank 3, frame inside the intro → **scores 0** | rank 2, frame on the dish |
+
+The fix follows from what each channel actually knows: a text hit says *which video*, the dense index
+says *where inside it*. Shots are now ranked by the best cosine any of their keyframes reaches against
+the query vector, and with no encoder the fallback is an even spread over the whole video — still
+wrong, but wrong in a way that does not concentrate on the one shot every episode shares. Locked by
+`test_a_video_level_hit_does_not_collapse_onto_the_first_shots`.
+
+This is the shape of failure §8 E3 warns about: nothing raised, every internal metric looked normal,
+and a third of the submission was spent on frames that could not score.
 
 ### P9 — Verification and reranking
 
@@ -697,6 +771,21 @@ spare capacity.
 **A condition to confirm with the organisers.** The strategy assumes the scoring system accepts several
 answers sharing a `(video_id, frame_id)` with different `answer` values. The rules do not forbid it, but
 this is an assumption that should be confirmed first. `hedge_answers=False` provides the safe mode.
+
+**Until the vision-language model exists, answers enter through the same interface, from a human.**
+`Engine.solve(answers=[(text, prob), ...])` accepts hypotheses from any source and `aic run
+--answers` reads them from a file. This is not a stopgap bolted to the side: the answer axis is one
+of three conjuncts, so without it a Q&A row cannot score however good the retrieval — measured, the
+three Q&A queries of the first submission were a guaranteed zero, 12.5 % of the total. All three
+answers turned out to be **on-screen text** (a commune name on a banner, a couplet beside a bust, a
+dish name on a recipe sheet), which is the strongest argument in this document for building P4: the
+channel that would have found them automatically is the one not yet built.
+
+**A verified row belongs at the head of the list.** `solve(pins=[(video, frame), ...])` places rows a
+human has confirmed by looking at the frame ahead of everything the model proposed. The reason is
+arithmetic, not preference: the one Q&A query whose answer the pipeline did find placed it at **slot
+29**, keeping 0.4 of the 1.0 it had already earned. Pins carry `source="pinned"` and gain 0 in the
+trace, so no report presents them as model predictions.
 
 **Difficulty.** Semantic scoring ($a \equiv GT_a$) means the answer's form is flexible but its content
 must match. Answers should be short and direct; a long answer carrying extra content risks being judged
@@ -793,6 +882,53 @@ With $\Pr(\text{hit}\mid S) = \sum_v \pi_v \kappa_v(S_v)$ the marginal gain is a
 and the whole loop runs in milliseconds. The implementation uses lazy greedy (CELF), which visits far
 fewer candidates per step and — as `tests/test_allocator.py` asserts element by element — produces the
 identical gain sequence.
+
+**The tie rule that made the loop non-terminating.** Ties are the common case here, not an edge case:
+two frames at least L apart cover exactly L start positions each, so their gains are equal by
+construction, and the tie is broken on the candidate's own confidence so that slot 1 lands on the
+anchor frame of a locus (H3). The first implementation compared a *freshly computed* gain against the
+*stale* gain of the next heap entry. A candidate whose true gain was the largest by 3e-18 — inside the
+tie tolerance — but whose score lost the tie-break was pushed back unchanged, returned to the top of
+the heap, and popped again forever: measured at **399,645 pops of a single key** and 12.3 million
+interval-union evaluations without terminating. At a budget of 70 slots the same query finished in
+0.08 s, which is why the defect survived until a 100-slot run on the real query set.
+
+The fix is the textbook CELF invariant: an entry is accepted only once its gain has been recomputed
+against the **current** selection. A stale gain is an upper bound (coverage is submodular, so gains
+only shrink), so a clean entry at the top of the heap is still the true greedy maximum with the same
+tie-break; and every iteration either accepts or turns one stale entry clean, bounding a slot at
+2·|heap| pops. All three allocators shared the defective rule and now share one implementation.
+
+**The calibration this algorithm assumes, and what happens without it.** Greedy coverage is optimal
+for $\mathbb{E}[\text{Final}]$ *given* $\pi_v$. It is not robust to $\pi_v$ being wrong in a
+particular way: nearly uniform. RRF scores live in a narrow band, so normalising them linearly gave
+the leading video about **6 %** of the mass, and under a posterior that flat, spreading slots across
+thirty videos is the correct move — for that posterior. Measured on the eight queries of round 1
+whose answer is known:
+
+| | Rank of the correct video |
+|---|---|
+| in the translated dense channel | **1st on five queries, 2nd on two, 3rd on one** |
+| in the fused candidate list | 1st to 15th |
+| in the 100 submitted rows | 51st, 71st, or **absent** |
+
+Retrieval was not the failure. The answer was found, fused down, and then hedged away. Two changes
+fixed it, both measured on those eight queries (`aic evaluate`, real scoring function):
+
+| Configuration | mean Final | R@100 |
+|---|---|---|
+| as submitted | 0.125 | 0.375 |
+| translated channel weighted 6x, sparse channels halved | 0.225 | 0.625 |
+| plus `pi_sharpness = 3` | **0.575** | **1.000** |
+
+`pi_sharpness` raises $\pi_v$ to a power before normalising — monotone, so it changes no ranking,
+only how much mass the leader holds and therefore how many slots the allocator commits before it
+starts hedging. Pushed too far it fails the other way: at an exponent of 5 or more with the old
+weights, everything went to one video and the mean fell to **0.000**. The two knobs are coupled and
+neither is safe alone.
+
+Both values are calibrated on **eight** queries. That is enough to see a factor of four and nowhere
+near enough to separate 2 from 3.
 
 **Emergent behaviour.** The algorithm needs no hand-written rules; three behaviours arise automatically
 from the structure of the problem:
@@ -901,23 +1037,27 @@ load/release.
 ```
 Vietnamese query
  └─ parse → control structure                                   [P7]
+     │   frame words stripped, moments read off E-labels
      │
-     ├─ dense(translation)  ─┐
-     ├─ dense(original)      ├─ RRF → ~500 candidate shots      [P8]
-     ├─ BM25(keywords)      ─┤
-     └─ fuzzy(entities)     ─┘
+     ├─ dense(original, EN tower)     ─┐
+     ├─ dense(original, multilingual)  │
+     ├─ BM25(8 top-IDF terms, titles)  ├─ RRF → ~500 candidate shots   [P8]
+     ├─ BM25(8 top-IDF terms, full)    │
+     └─ fuzzy(entities)               ─┘
                               │
                     cheap rerank → 50 candidates
                               │
-                    2B VLM verification + calibration           [P9]
+                    2B VLM verification + calibration           [P9]  NOT BUILT
                               │
         ┌─────────────────────┼─────────────────────┐
       KIS                   Q&A                  TRAKE
-  frame spread          VQA + hedge          full-fps + DP
-     [P10]                 [P11]                 [P12]
+  frame spread       supplied answers      full-fps + DP
+     [P10]            + hedge [P11]       keyframe-only [P12]
         └─────────────────────┼─────────────────────┘
                               │
               band-weighted greedy coverage → 100 slots         [P13]
+                              │
+              human-verified rows pinned to the head            [P11]
 ```
 
 ### 9.3. Three structural properties

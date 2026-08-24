@@ -49,7 +49,8 @@ aic = "aic.cli:main"
 # This machine terminates TLS with a certificate uv's bundled roots do not trust, so uv must use
 # the operating system's certificate store. Harmless elsewhere; without it every uv command fails
 # with "invalid peer certificate: UnknownIssuer".
-native-tls = true
+system-certs = true
+link-mode = "copy"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -65,6 +66,9 @@ pythonpath = ["src"]
 line-length = 100
 target-version = "py311"
 src = ["src", "scripts", "tests"]
+# The organisers' baseline notebook is third-party material kept verbatim for reference;
+# linting it would only produce noqa noise in a file we must not edit.
+extend-exclude = ["docs/*.ipynb"]
 
 [tool.ruff.lint]
 select = [

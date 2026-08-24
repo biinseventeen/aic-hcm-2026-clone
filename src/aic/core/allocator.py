@@ -43,8 +43,9 @@ Three emergent behaviours (no hand-written rule produces them)
 from __future__ import annotations
 
 import heapq
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -63,8 +64,50 @@ __all__ = [
 ]
 
 #: Gains equal to within this tolerance are treated as tied. Ties are the common case, not
-#: an edge case: any two frames at least L apart cover exactly L start positions each.
+#: an edge case: any two frames at least L apart cover exactly L start positions each. The
+#: tolerance is only used for *reporting*; the selection itself resolves ties through the heap
+#: ordering, which is exact — see :func:`_pick_next`.
 GAIN_TIE_EPS = 1e-15
+
+
+def _pick_next(
+    heap: list[tuple[float, float, int, Any]],
+    *,
+    gain_of: Callable[[Any], float],
+    score_of: Callable[[Any], float],
+    trace: AllocationTrace,
+    available: Callable[[Any], bool] | None = None,
+) -> tuple[Any, float] | None:
+    """One lazy-greedy (CELF) pick. Returns ``(key, gain)``, or ``None`` when nothing is left.
+
+    The heap is ordered by ``(-gain, -score, insertion order)``, so among equal gains the
+    higher-scoring candidate surfaces first — the property H3 needs, so that slot 1 lands on the
+    anchor frame of a locus rather than an arbitrary frame inside it.
+
+    An entry is accepted only once its gain has been recomputed against the **current**
+    selection, tracked here as *clean*. Comparing a freshly computed gain against the *stale*
+    gain of the next entry instead is what used to make this loop spin forever: a candidate whose
+    true gain was the largest by ~1e-18 but whose score lost the tie-break was pushed back
+    unchanged, returned to the top of the heap, and popped again — measured at 399,645 pops of a
+    single key on query ``p1-6``, with no way out. Accepting a clean top entry is still the true
+    greedy maximum, because a stale gain is an upper bound on the current one (coverage is
+    submodular, so gains only shrink as the selection grows). Every iteration either returns or
+    turns one stale entry clean, so a slot costs at most ``2 * len(heap)`` pops.
+    """
+    clean: set[Any] = set()
+    while heap:
+        neg_gain, _neg_score, order, key = heapq.heappop(heap)
+        if available is not None and not available(key):
+            continue
+        if key in clean:
+            return key, -neg_gain
+        gain = gain_of(key)
+        trace.n_reevaluations += 1
+        if not heap:
+            return key, gain
+        clean.add(key)
+        heapq.heappush(heap, (-gain, -score_of(key), order, key))
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -229,26 +272,15 @@ def allocate_kis(
 
     cumulative = 0.0
     for rank in range(1, budget + 1):
-        chosen: tuple[str, int] | None = None
-        chosen_gain = 0.0
-        while heap:
-            _stale, _neg_score, _order, key = heapq.heappop(heap)
-            candidate = pool[key]
-            gain = coverage.marginal_gain(selection, candidate.video_id, candidate.frame_id)
-            trace.n_reevaluations += 1
-            # If the recomputed gain still beats the next element's upper bound, it is the
-            # maximum. The comparison is tie-aware: on equal gains the held candidate must
-            # have a score at least as high as the next one to be accepted.
-            if not heap:
-                chosen, chosen_gain = key, gain
-                break
-            next_gain, next_score = -heap[0][0], -heap[0][1]
-            if gain > next_gain + GAIN_TIE_EPS or (
-                abs(gain - next_gain) <= GAIN_TIE_EPS and candidate.score >= next_score
-            ):
-                chosen, chosen_gain = key, gain
-                break
-            heapq.heappush(heap, (-gain, -candidate.score, order[key], key))
+        picked = _pick_next(
+            heap,
+            gain_of=lambda key: coverage.marginal_gain(
+                selection, pool[key].video_id, pool[key].frame_id
+            ),
+            score_of=lambda key: pool[key].score,
+            trace=trace,
+        )
+        chosen, chosen_gain = picked if picked is not None else (None, 0.0)
         if chosen is None:
             trace.exhausted_at = rank
             trace.notes.append(
@@ -336,23 +368,13 @@ def allocate_qa(
 
     cumulative = 0.0
     for rank in range(1, budget + 1):
-        chosen: tuple[str, int, str] | None = None
-        chosen_gain = 0.0
-        while heap:
-            _stale, _neg_score, _order, key = heapq.heappop(heap)
-            candidate = pool[key]
-            gain = gain_of(candidate)
-            trace.n_reevaluations += 1
-            if not heap:
-                chosen, chosen_gain = key, gain
-                break
-            next_gain, next_score = -heap[0][0], -heap[0][1]
-            if gain > next_gain + GAIN_TIE_EPS or (
-                abs(gain - next_gain) <= GAIN_TIE_EPS and candidate.score >= next_score
-            ):
-                chosen, chosen_gain = key, gain
-                break
-            heapq.heappush(heap, (-gain, -candidate.score, order[key], key))
+        picked = _pick_next(
+            heap,
+            gain_of=lambda key: gain_of(pool[key]),
+            score_of=lambda key: pool[key].score,
+            trace=trace,
+        )
+        chosen, chosen_gain = picked if picked is not None else (None, 0.0)
         if chosen is None:
             trace.exhausted_at = rank
             trace.notes.append(f"ran out of distinct (video, frame, answer) triples at slot {rank}")
@@ -485,30 +507,24 @@ def allocate_trake(
     best = np.zeros(n_samples, dtype=np.float32)
     cumulative = 0.0
     remaining = set(range(len(pool)))
-    heap = [(-float(r_matrix[i].mean()), -pool[i].score, i) for i in remaining]
+    # The fourth element is the heap key; here it is the candidate index, which doubles as the
+    # insertion order, so the tie-break is unchanged.
+    heap = [(-float(r_matrix[i].mean()), -pool[i].score, i, i) for i in remaining]
     heapq.heapify(heap)
 
     for rank in range(1, budget + 1):
-        chosen: int | None = None
-        chosen_gain = 0.0
-        while heap:
-            _stale, _neg_score, index = heapq.heappop(heap)
-            if index not in remaining:
-                continue
-            gain = float(np.maximum(best, r_matrix[index]).mean()) - cumulative
-            trace.n_reevaluations += 1
-            if not heap:
-                chosen, chosen_gain = index, gain
-                break
-            next_gain, next_score = -heap[0][0], -heap[0][1]
-            # Monte Carlo noise makes exact float ties rarer here, so the tolerance is
-            # looser than GAIN_TIE_EPS: differences below it are sampling noise, not signal.
-            if gain > next_gain + 1e-12 or (
-                abs(gain - next_gain) <= 1e-12 and pool[index].score >= next_score
-            ):
-                chosen, chosen_gain = index, gain
-                break
-            heapq.heappush(heap, (-gain, -pool[index].score, index))
+        picked = _pick_next(
+            heap,
+            # best and cumulative are rebound each slot, so they are bound as defaults rather
+            # than captured by reference.
+            gain_of=lambda index, best=best, cumulative=cumulative: (
+                float(np.maximum(best, r_matrix[index]).mean()) - cumulative
+            ),
+            score_of=lambda index: pool[index].score,
+            trace=trace,
+            available=remaining.__contains__,
+        )
+        chosen, chosen_gain = picked if picked is not None else (None, 0.0)
         if chosen is None:
             trace.exhausted_at = rank
             trace.notes.append(f"ran out of distinct TRAKE tuples at slot {rank}")

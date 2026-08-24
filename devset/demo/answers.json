@@ -1,0 +1,30 @@
+{
+  "_about": [
+    "Q&A answer hypotheses, read off the video frames by hand. Input to: aic run --answers.",
+    "Until a VQA model exists (CONSTRAINTS G5) this file is the only thing that can make the",
+    "answer axis of a Q&A row score at all.",
+    "Several phrasings per query on purpose: the result specification says the answer is compared",
+    "semantically in one place and as an exact string in another, so the safe play is to spend a",
+    "few slots on the plausible spellings of the same answer (docs/SUBMISSION.md 4.3)."
+  ],
+  "_evidence": {
+    "p1-15": "L30_V072 keyframe 009 (frame 676) and 035 (frame 1776): the event banner reads 'CÙNG EM ĐẾN TRƯỜNG — Xã Giang Ly, huyện Khánh Vĩnh, tỉnh Khánh Hoà — 04.08.2024'.",
+    "p1-19": "L27_V010 keyframe 146 (frame 5535): the couplet flanking the bust of Nguyễn Trung Trực inside the temple reads 'HỎA HỒNG NHẬT TẢO OANH THIÊN ĐỊA' / 'KIẾM BẠT KIÊN GIANG KHẤP QUỶ THẦN' (Huỳnh Mẫn Đạt).",
+    "p1-22": "L30_V078 keyframe 031 (frame 1848): the recipe sheet held up in the class is titled 'Nhân bánh cuốn' and lists '- Nạc dăm xay 200 gr (ướp bột nêm)'."
+  },
+  "p1-15": [
+    { "text": "Giang Ly", "prob": 0.5 },
+    { "text": "Xã Giang Ly", "prob": 0.35 },
+    { "text": "Xã Giang Ly, huyện Khánh Vĩnh", "prob": 0.15 }
+  ],
+  "p1-19": [
+    { "text": "Hỏa hồng Nhật Tảo oanh thiên địa, Kiếm bạt Kiên Giang khấp quỷ thần", "prob": 0.6 },
+    { "text": "Hỏa hồng Nhật Tảo oanh thiên địa / Kiếm bạt Kiên Giang khấp quỷ thần", "prob": 0.25 },
+    { "text": "Hoả hồng Nhật Tảo oanh thiên địa, Kiếm bạt Kiên Giang khấp quỷ thần", "prob": 0.15 }
+  ],
+  "p1-22": [
+    { "text": "Nhân bánh cuốn", "prob": 0.6 },
+    { "text": "Bánh cuốn", "prob": 0.25 },
+    { "text": "Nhân bánh cuốn (nạc dăm xay)", "prob": 0.15 }
+  ]
+}

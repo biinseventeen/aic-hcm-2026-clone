@@ -103,6 +103,19 @@ class RetrievalConfig:
     max_shots_per_video: int = 12
     #: locus padding on each side when spreading frames, in seconds (events cross boundaries).
     locus_pad_seconds: float = 0.5
+    #: Exponent applied to the video-level score before it is normalised into ``pi_v``.
+    #: 1.0 is the linear normalisation of the RRF scores, which is nearly uniform and makes the
+    #: allocator hedge across ~30 videos; larger values concentrate the mass on the leaders, which
+    #: is what the band weights reward when the leading channel is usually right. Calibrated on
+    #: the eight labelled queries of round 1 — a sample far too small to trust beyond one
+    #: significant figure. See DESIGN.md P13.
+    pi_sharpness: float = 3.0
+    #: highest-IDF query terms kept for the BM25 channel. The published queries are paragraphs
+    #: wrapped in instruction phrasing, and running BM25 over all ~24 of their terms hands the
+    #: top slots to whichever video is topically broadest: measured on the mock set, one
+    #: travel-show video held slot 1 of four queries while the video whose title contained the
+    #: query's subject sat at slot 26. Pruning to 8 terms puts that video at BM25 rank 1.
+    sparse_max_terms: int = 8
 
 
 @dataclass
@@ -115,9 +128,9 @@ class PathConfig:
     of every caller.
     """
 
-    #: Read-only input: the ``data/raw`` link pointing at the organiser's corpus; see
+    #: Read-only input: the ``data/batch1`` link pointing at the organiser's corpus; see
     #: ``scripts/link_data.py``. ``AIC_DATA_ROOT`` overrides this value.
-    data_root: str = "data/raw"
+    data_root: str = "data/batch1"
 
     # Everything derived from the raw data lives under data/processed. It is all reproducible
     # from `aic build-index` and `aic run`, and none of it belongs in version control — the
@@ -169,6 +182,13 @@ class Config:
     seed: int = 0
     #: the text encoder must be in the *same space* as the indexed features.
     text_encoder: str = "clip-ViT-B-32"
+    #: Second text tower, distilled to embed 50+ languages into the *same* image space as
+    #: ``clip-ViT-B-32``. It runs as an independent dense channel rather than replacing the
+    #: first, because neither dominates: measured on the mock set, the monolingual tower puts
+    #: the panna-cotta video at video-rank 5 where this one puts it at 564, while this one puts
+    #: the FANA charity video at rank 1 where the monolingual tower does not find it at all.
+    #: Loan words favour the English tower; Vietnamese prose favours this one. Empty disables it.
+    text_encoder_multilingual: str = "sentence-transformers/clip-ViT-B-32-multilingual-v1"
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)
@@ -217,7 +237,7 @@ def load_config(
             config.retrieval = RetrievalConfig(
                 **{**asdict(config.retrieval), **payload["retrieval"]}
             )
-        for key in ("fps_default", "seed", "text_encoder"):
+        for key in ("fps_default", "seed", "text_encoder", "text_encoder_multilingual"):
             if key in payload:
                 setattr(config, key, payload[key])
     elif path is not None:

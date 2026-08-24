@@ -98,13 +98,6 @@ def test_a_newline_in_an_answer_is_an_error():
     assert _errors(validate(submission))
 
 
-def test_a_very_long_answer_is_a_warning():
-    submission = QuerySubmission("1", "qa", [Answer("L21_V001", frame=7, answer="x" * 300)])
-    issues = validate(submission)
-    assert not _errors(issues)
-    assert any("very long" in issue.message for issue in _warnings(issues))
-
-
 def test_the_wrong_trake_moment_count_is_an_error():
     submission = QuerySubmission("1", "trake", [Answer("L21_V001", frames=(1, 2, 3))], n_moments=4)
     assert _errors(validate(submission))
@@ -192,6 +185,19 @@ def test_a_filename_off_the_pattern_is_a_warning(tmp_path):
     assert any("filename does not match" in issue.message for issue in _warnings(issues))
 
 
+def test_a_hyphenated_query_id_is_still_validated(tmp_path):
+    """The organisers' ids contain hyphens: query-p1-18-trake.csv must not be skipped."""
+    submission = QuerySubmission(
+        "p1-18", "trake", [Answer("L21_V001", frames=(1, 2, 3, 4))], n_moments=4
+    )
+    path, _ = write_submission(submission, tmp_path, strict=False)
+    assert path.name == "query-p1-18-trake.csv"
+    issues = validate_submission_dir(tmp_path)
+    assert not any("filename does not match" in issue.message for issue in issues)
+    # The short-list warning proves the rows were actually read, not skipped over.
+    assert any("slots submitted" in issue.message or "100" in issue.message for issue in issues)
+
+
 def test_reading_back_preserves_row_order(tmp_path):
     """Row order is decisive — R@k reads by position."""
     frames = [500, 12, 999, 7]
@@ -262,7 +268,8 @@ def test_a_wrong_encoding_does_not_crash(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_the_archive_is_flat(tmp_path):
+def test_the_archive_holds_a_submission_directory(tmp_path):
+    """The specification is explicit: the CSV files sit inside a submission/ directory."""
     paths = [
         write_submission(_full_kis(), tmp_path, strict=False)[0],
         write_submission(
@@ -274,8 +281,45 @@ def test_the_archive_is_flat(tmp_path):
     archive_path = package_submission(paths, tmp_path / "submission.zip")
     with zipfile.ZipFile(archive_path) as archive:
         names = archive.namelist()
-    assert sorted(names) == ["query-1-kis.csv", "query-2-qa.csv"]
-    assert all("/" not in name for name in names)
+    assert sorted(names) == ["submission/query-1-kis.csv", "submission/query-2-qa.csv"]
+
+
+def test_the_archive_directory_is_configurable(tmp_path):
+    path = write_submission(_full_kis(), tmp_path, strict=False)[0]
+    archive_path = package_submission(
+        [path], tmp_path / "flat.zip", naming=SubmissionNaming(zip_dir="")
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        assert archive.namelist() == ["query-1-kis.csv"]
+
+
+def test_an_answer_over_one_hundred_characters_is_an_error():
+    """The specification caps a Q&A answer at 100 characters."""
+    submission = QuerySubmission("1", "qa", [Answer("L21_V001", frame=1, answer="x" * 101)])
+    issues = _errors(validate(submission))
+    assert any("over the 100" in issue.message for issue in issues)
+    assert not _errors(
+        validate(QuerySubmission("1", "qa", [Answer("L21_V001", frame=1, answer="x" * 100)]))
+    )
+
+
+def test_surrounding_whitespace_in_an_answer_is_a_warning():
+    """Whitespace is preserved, not trimmed, so " 5" and "5" are two different answers."""
+    submission = QuerySubmission("1", "qa", [Answer("L21_V001", frame=1, answer=" 5")])
+    assert any("whitespace" in issue.message for issue in _warnings(validate(submission)))
+
+
+def test_an_answer_needing_quotes_is_quoted_and_reads_back_unchanged(tmp_path):
+    """A comma or a quote inside an answer must survive the write/read round trip."""
+    answers = [
+        Answer("L21_V001", frame=1, answer="Có 3 người, gồm nam và nữ"),
+        Answer("L21_V002", frame=2, answer='Anh ấy nói "Xin chào"'),
+    ]
+    path, _ = write_submission(QuerySubmission("7", "qa", answers), tmp_path, strict=False)
+    raw = path.read_text(encoding="utf-8")
+    assert '"Có 3 người, gồm nam và nữ"' in raw
+    assert '"Anh ấy nói ""Xin chào"""' in raw
+    assert not _errors(validate_submission_dir(tmp_path))
 
 
 def test_packaging_a_missing_file_raises(tmp_path):

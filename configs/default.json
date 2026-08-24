@@ -1,6 +1,6 @@
 {
   "paths": {
-    "data_root": "data/raw",
+    "data_root": "data/batch1",
     "index_dir": "data/processed/index",
     "submission_dir": "data/processed/submissions",
     "report_dir": "data/processed/reports",
@@ -19,9 +19,12 @@
     "n_verify": 50,
     "dedup_cosine": 0.92,
     "max_shots_per_video": 12,
-    "locus_pad_seconds": 0.5
+    "locus_pad_seconds": 0.5,
+    "sparse_max_terms": 8,
+    "pi_sharpness": 3.0
   },
   "fps_default": 25.0,
   "seed": 0,
-  "text_encoder": "clip-ViT-B-32"
+  "text_encoder": "clip-ViT-B-32",
+  "text_encoder_multilingual": "sentence-transformers/clip-ViT-B-32-multilingual-v1"
 }

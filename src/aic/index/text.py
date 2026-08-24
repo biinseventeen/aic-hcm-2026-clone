@@ -40,11 +40,13 @@ from ..log import log
 
 __all__ = [
     "NOISE_PHRASES",
+    "QUERY_FRAME_WORDS",
     "STOPWORDS",
     "TextDoc",
     "TextIndex",
     "char_ngrams",
     "docs_from_media_info",
+    "docs_from_titles",
     "normalize_vi",
     "strip_diacritics",
     "tokenize_vi",
@@ -67,6 +69,33 @@ STOPWORDS: frozenset[str] = frozenset(
     và của có là các một những trong cho được với người khi đã cũng này đó tại về
     từ đến trên dưới ra vào theo như thì mà nhưng hoặc bị nên rất sẽ không chưa
     https http www com vn youtube youtu be bit ly fb facebook
+    """.split()  # noqa: SIM905 — a block string keeps this word list reviewable as data
+)
+
+#: Words belonging to the *instruction frame* of a query rather than to its content: "Đoạn clip
+#: cần tìm là cảnh ...", "Hãy tìm chính xác phân cảnh ...", "Khoảnh khắc đầu tiên ...".
+#:
+#: These are filtered on the **query side only** (:meth:`TextIndex.informative_terms`) and never
+#: at index time. They cannot be handled by IDF, and this is the subtle part: descriptions in
+#: ``media-info`` never say "đoạn clip cần tìm", so these words are *rare in the corpus* and
+#: therefore score a **high** IDF — the opposite of what they deserve. Corpus IDF measures
+#: rarity; it cannot tell "rare because discriminative" from "rare because it is boilerplate the
+#: organisers wrap every query in".
+#:
+#: Membership is deliberately conservative — the tokeniser splits syllables, so removing one
+#: syllable of a content word is the failure mode described at :data:`STOPWORDS`. Excluded for
+#: that reason, even though they look like frame words: ``ảnh`` ("máy ảnh"), ``hình`` ("hình
+#: thù"), ``đầu`` ("đầu bếp", "đầu tiên"), ``quay`` ("lân quay vòng"), ``tay`` ("bàn tay", "tay
+#: đua"), ``đứng`` ("hai người đứng").
+#: Moment labels as the organisers write them, across two published sets: ``E1:`` with a colon in
+#: one, bare ``E1 `` in the next. The punctuation is therefore optional, but then at least one
+#: space is required — without that, ``E`` followed by a digit inside a word would match.
+_LABELLED_MOMENT_PATTERN = r"^[ \t]*E[ \t]*\d+[ \t]*(?:[:.)][ \t]*|[ \t])"
+
+QUERY_FRAME_WORDS: frozenset[str] = frozenset(
+    """
+    đoạn clip video phân cảnh tìm cần mô tả thấy hãy khoảnh khắc xác tiên gồm
+    vài nữa kèm tạo cảm giác nổi bật chính đây đó sau lần lượt khác thêm còn việc
     """.split()  # noqa: SIM905 — a block string keeps this word list reviewable as data
 )
 
@@ -233,9 +262,44 @@ class TextIndex:
 
     # -- querying ---------------------------------------------------------
 
-    def search_bm25(self, query: str, *, top_k: int = 1000) -> list[tuple[int, float]]:
-        """BM25. Returns ``[(doc_id, score)]`` in decreasing score."""
-        tokens = tokenize_vi(query)
+    def informative_terms(self, query: str, *, max_terms: int) -> list[str]:
+        """The ``max_terms`` query terms with the highest IDF, in descending IDF order.
+
+        Measured need. The published queries are long descriptions wrapped in instruction
+        phrasing ("Đoạn clip cần tìm là cảnh ..."), so a full-query BM25 runs on ~24 terms of
+        which most are generic. Documents that are *topically broad* then win every query: on the
+        24-query mock set, one travel-show video held slot 1 of four different queries and sat in
+        the top 5 of nine, while the video whose title literally contained the query's subject
+        ("PANNA COTTA") was pushed to slot 26.
+
+        Selecting by IDF cannot repeat the mistake documented at :data:`STOPWORDS`: it keeps the
+        *rarest* terms, which are exactly the discriminative ones, and it adapts to the corpus
+        instead of relying on a hand-maintained list.
+        """
+        if max_terms <= 0:
+            raise ValueError(f"max_terms must be >= 1, got {max_terms}")
+        seen: dict[str, float] = {}
+        for term in tokenize_vi(query):
+            if term in QUERY_FRAME_WORDS or term.isdigit() or len(term) < 2:
+                continue
+            if term in self._idf and term not in seen:
+                seen[term] = self._idf[term]
+        return [term for term, _ in sorted(seen.items(), key=lambda kv: -kv[1])[:max_terms]]
+
+    def search_bm25(
+        self, query: str, *, top_k: int = 1000, max_terms: int | None = None
+    ) -> list[tuple[int, float]]:
+        """BM25. Returns ``[(doc_id, score)]`` in decreasing score.
+
+        ``max_terms`` keeps only that many highest-IDF query terms — see
+        :meth:`informative_terms`. ``None`` uses every term, which is the right behaviour for a
+        short query and the wrong one for a paragraph.
+        """
+        tokens = (
+            self.informative_terms(query, max_terms=max_terms)
+            if max_terms is not None
+            else tokenize_vi(query)
+        )
         if not tokens or not self._postings:
             return []
         scores: dict[int, float] = defaultdict(float)
@@ -328,6 +392,30 @@ class TextIndex:
             ngram=payload.get("ngram", 3),
         )
         return index.build(with_fuzzy=with_fuzzy)
+
+
+def docs_from_titles(media_info: dict[str, dict]) -> list[TextDoc]:
+    """Build title-only documents — a deliberately separate, boilerplate-free index.
+
+    Why this exists as its own index rather than a field of the one below: a query term hitting a
+    **title** is near-certain evidence, while the same term hitting a YouTube description is
+    weak. Concatenated into one document the two are indistinguishable, and the fusion layer can
+    only assign one weight to the mixture. Measured on the mock set: the video titled "PANNA
+    COTTA KEM MUỐI" is BM25 rank 1 for the panna-cotta query, yet it landed at slot 34 of the
+    submission because the mixed channel could not be trusted enough to outvote two dense
+    channels. A title index can be, because titles carry no subscribe links, no hashtag walls
+    and no SEO tag soup.
+    """
+    return [
+        TextDoc(
+            doc_id=doc_id,
+            video_id=video_id,
+            text=str(info.get("title") or ""),
+            source="media-info",
+        )
+        for doc_id, (video_id, info) in enumerate(sorted(media_info.items()))
+        if str(info.get("title") or "").strip()
+    ]
 
 
 def docs_from_media_info(

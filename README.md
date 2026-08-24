@@ -12,10 +12,12 @@ function.
 |---|---|
 | [`docs/DESIGN.md`](docs/DESIGN.md) | Full design: objective formalisation, the 13 sub-problems, cost analysis |
 | [`docs/DATA_AUDIT.md`](docs/DATA_AUDIT.md) | **Input** — the supplied data, schemas, measurements on the real corpus, anomalies |
+| [`docs/PIPELINE_IO.md`](docs/PIPELINE_IO.md) | **The contract** — every file the pipeline reads and writes, and where each rule is enforced |
 | [`docs/SUBMISSION.md`](docs/SUBMISSION.md) | **Output** — submission format, what the rules state vs. what we assume, checklist |
 | [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md) | **Constraints**, blocking items, gaps, open risks |
 | [`docs/BACKEND.md`](docs/BACKEND.md) | Using `aic` as a module for a backend: `Engine`, HTTP endpoints, operations |
 | `docs/Thong tin vong So tuyen AIC2026.pdf` | The rules, as published |
+| `docs/AIC_2026_Baseline_v1.ipynb` | The organisers' FiftyOne baseline, kept verbatim; what it confirms is in `DATA_AUDIT.md` §11 |
 
 ---
 
@@ -72,25 +74,36 @@ lets `aic validate` and the whole test suite run in a minimal environment.
 
 ## Blocking items
 
-`sentence-transformers` is not installed by default, so the text encoder cannot load and every
-query scores zero until you run `uv sync --extra encoder`. `torch` resolves to a CPU build even
-though the machine has an RTX 4060 8 GiB, and `ffmpeg` is absent (which blocks TRAKE). Details and
-remedies: [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md), items C4–C6.
+The text encoder is **installed and working** (`clip-ViT-B-32`, 512 dimensions, matching the
+index), together with a second multilingual tower in the same image space that carries the
+Vietnamese queries. Three things had to be true at once and two are easy to miss — install every
+extra in one `uv sync`, add `pillow`, and give Python a certificate store it trusts before fetching
+the weights: [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md) item C4.
+
+What still blocks parts of the system: `torch` resolves to a CPU build although the machine has an
+RTX 4060 8 GiB (C6), `ffmpeg` is absent so TRAKE runs keyframe-only at a ~14.5 % ceiling per moment
+(C5), and there is no OCR, speech or VQA channel (G2, G3, G5) — which is why Q&A answers currently
+enter through `--answers` rather than being produced by the pipeline.
 
 ---
 
 ## Pointing at the data
 
 ```bash
-uv run python scripts/link_data.py            # create the data/raw link to the corpus
+uv run python scripts/link_data.py            # create the data/batch1 link to the corpus
 uv run python scripts/link_data.py --check    # verify the link and what is visible through it
 ```
 
-`configs/default.json` says `data/raw`, and `data/raw` is a **directory junction** pointing at the
-real corpus (107 GiB, which cannot live in the repository). The configuration is therefore identical
-on every machine, and the link is the single place that knows where the data actually is. For a
-corpus stored elsewhere use `--target E:/AIC`, or set `AIC_DATA_ROOT` (which overrides the config
-file).
+`configs/default.json` says `data/batch1`, and `data/batch1` is a **directory junction** pointing
+at the real corpus (107 GiB, which cannot live in the repository). The configuration is therefore
+identical on every machine, and the link is the single place that knows where the data actually
+is. For a corpus stored elsewhere use `--target E:/AIC`, or set `AIC_DATA_ROOT` (which overrides
+the config file).
+
+The name says **which release** the link points at: everything measured so far comes from batch 1
+(L21–L30, 873 videos). A second batch arrives as its own link and its own `data_root`, so the two
+never end up mixed inside one index — and a number in the docs can always be traced to the batch
+it was measured on.
 
 ### Extracting and pruning archives
 
@@ -116,11 +129,19 @@ archives being deleted — see [`docs/DATA_AUDIT.md`](docs/DATA_AUDIT.md) §1.2.
 uv run aic inventory          # list the data, confirm what is present and from which source
 uv run aic validate           # BLOCKING ITEM — frame index convention + cross-checks
 uv run aic build-index        # build the dense, shot and text indexes
+uv run aic build-index --only text   # rebuild one stage; the dense index is 173 MiB
 uv run aic query "<text>"     # run one query, print the full trace
 uv run aic run queries.json   # run a whole set, write submissions, package the zip
+uv run aic run queries.json --answers a.json --pins p.json   # see below
 uv run aic check-submission   # final gate: read back from disk and validate
 uv run aic serve              # HTTP backend — see docs/BACKEND.md
 ```
+
+Two of those flags exist because parts of the pipeline are not built yet, and the score cannot
+wait for them. `--answers` supplies Q&A answer hypotheses (the answer axis is one of three conjuncts
+a Q&A row is scored on, and no VQA model exists), and `--pins` puts rows a human has verified by
+looking at the frame at the head of the list, where slot 1 is worth a fifth of a query's score. Both
+take a JSON file; [`devset/demo/`](devset/demo/README.md) holds a worked example of each.
 
 Every hyperparameter that affects the score lives in
 [`configs/default.json`](configs/default.json), generated from `aic.config.Config` so the file and
@@ -147,11 +168,11 @@ P1 — frame index convention checked over 177,321 keyframes
 ```
 src/aic/          the library (see Architecture below)
 tests/            321 tests, including doctests in src
-scripts/          data plumbing: link, extract, prune
+scripts/          data plumbing: link, extract, prune, build query set
 configs/          default.json — every score-affecting hyperparameter
 docs/             design, data audit, submission spec, constraints, backend
-devset/           hand-annotated evaluation set — TRACKED, see devset/README.md
-data/raw/         link to the organiser's corpus            (git-ignored)
+devset/           evaluation sets — TRACKED: blind-sampled + the organisers' mock exam
+data/batch1/      link to the organiser's corpus, batch 1  (git-ignored)
 data/processed/   index, reports, submissions, video cache  (git-ignored)
 ```
 

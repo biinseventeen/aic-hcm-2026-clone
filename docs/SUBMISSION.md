@@ -24,6 +24,23 @@ From "Thông tin vòng Sơ tuyển AIC2026", section 2:
 | TRAKE | Exactly **one** frame per stage; `N` is fixed by the query |
 | TRAKE, wrong video | **Hard zero**, with no per-moment credit |
 
+From "Yêu cầu kết quả" (the result specification), which settles the **file format** as well:
+
+| Item | Content |
+|---|---|
+| File | one `.csv` **text** file per query — never `.xlsx`/`.xls` |
+| Rows | at most 100, no header row, data starts on line 1 |
+| Encoding / delimiter | UTF-8 / comma |
+| Line ending | CRLF **or** LF, both accepted |
+| Quoting | only when needed: comma, quote (doubled `""`), or newline in an answer |
+| Whitespace | **preserved, not trimmed** — a stray space changes the answer |
+| `video_id` | **without** `.mp4` |
+| `frame_id` | compared as an integer |
+| Q&A `answer` | at most **100 characters** |
+| TRAKE | frame count matches N exactly, in temporal order |
+| Archive | `.zip` containing a **`submission/` directory** with the CSV files inside |
+| Zip name | letters and digits recommended, e.g. `team_ABC_round1.zip` |
+
 The four worked examples from the rules, used as test cases (`tests/test_objective.py`):
 
 ```
@@ -38,38 +55,57 @@ All four are reproduced exactly by `aic.core.objective` and locked by tests.
 
 ---
 
-## 2. What the rules do **not** say, and what we assume
+## 2. Where each format decision comes from
 
-The rules specify the *content* of an answer but **not** the filename, the file format, or the
-packaging. Every assumption lives in **one place**: `aic.submit.writer.SubmissionNaming`, changeable
-in a single line without touching code.
+Most of this table used to read "convention of previous AIC seasons". The result specification has
+since settled nearly all of it — including one item where **the previous assumption was wrong**: the
+archive needs a `submission/` directory, not a flat layout.
 
-| Assumption | Default | Basis |
+| Decision | Value | Basis |
 |---|---|---|
-| One file per query | yes | Convention of previous AIC seasons |
-| Filename | `query-<id>-<task>.csv` | Convention of previous AIC seasons |
-| Header row | **no** | The scoring system reads by position; a header is easily counted as row 1 |
-| Delimiter | `,` | The rules write answers with commas |
-| Line terminator | `\r\n` | Safe for every CSV reader |
-| Encoding | UTF-8 | Q&A permits Vietnamese |
-| `video_id` | **without** `.mp4` | Matches the keyframe directory names and metadata filenames |
-| Packaging | one **flat** `.zip` | If the scoring system expects a subdirectory it will usually still find the files; the reverse does not hold |
+| One file per query | yes | **Stated** by the result specification, and matched by the organisers' own query files (`query-p1-1-kis.txt`) |
+| Filename | `query-<id>-<task>.csv` | **Stated**: their examples are `query-1-kis.csv`, `query-2-qa.csv`, `query-3-trake.csv` |
+| Header row | **no** | **Stated** |
+| Delimiter | `,` | **Stated** |
+| Line terminator | CRLF | **Stated** that CRLF or LF are both accepted; CRLF chosen |
+| Encoding | UTF-8 | **Stated** |
+| `video_id` | **without** `.mp4` | **Stated** |
+| Packaging | `.zip` holding `submission/` | **Stated**, and the opposite of what this project assumed before: a flat archive is explicitly wrong |
+| Q&A answer matching | semantic, with aliases | **Contradicted inside the specification itself** — see below |
+| Q&A rows sharing one `(video_id, frame_id)` | allowed | Not addressed either way |
 
-> Dropping the extension is a reasoned choice: the rules write `video_abc(.mp4)`, meaning the
-> extension is optional, and **every** other identifier in the data (keyframe directories,
-> `media-info` filenames, `clip-features` filenames) appears without it. If the organisers require
-> the extension: `SubmissionNaming(video_extension=".mp4")`.
+Every one of these lives in `aic.submit.writer.SubmissionNaming`, changeable in a single line.
+`package_submission` writes the `submission/` directory by default; `SubmissionNaming(zip_dir="")`
+restores a flat archive.
+
+> **The one real contradiction.** The Q&A section of the specification says the answer is compared
+> "chính xác **về mặt ngữ nghĩa**" (semantically), while the closing notes say "Answer (Q&A) sẽ được
+> so sánh dưới dạng **chuỗi chính xác**" (as an exact string). The two readings call for different
+> strategies:
+>
+> * *semantic* — one well-formed answer per frame is enough, and `aic.eval.score`'s numeric/alias
+>   tiers model the scoring correctly;
+> * *exact string* — the wording of the answer becomes a lottery, which makes the answer-axis hedge
+>   of §4.3 **more** valuable, not less: several phrasings of the same answer on the same frame are
+>   then the only defence, and every internal number produced by the semantic scorer is optimistic.
+>
+> Until the organisers answer, `--hedge-answers` (the default) is the strategy that survives both
+> readings. This is question 1 below.
 
 ### Questions to ask the organisers before submitting
 
-1. What is the submission file format and naming? One file per query, or one combined file?
-2. Is there a header row?
-3. Does `video_id` need the `.mp4` extension?
-4. **Q&A: may several rows share a `(video_id, frame_id)` with different `answer` values?** This is
-   the most consequential question for strategy. See §4.
-5. Roughly how many frames wide is the answer span `[s, e]` for KIS and Q&A?
-   (`CONSTRAINTS.md` R3: this is the most sensitive hyperparameter in the system.)
-6. By what mechanism is "matches semantically" decided for Q&A? (`CONSTRAINTS.md` R4)
+1. **Is the Q&A answer compared semantically or as an exact string?** The specification states
+   both, in two different places. This decides whether the answer-axis hedge is optional or
+   essential.
+2. **May several rows share a `(video_id, frame_id)` with different `answer` values?** Not addressed
+   by the specification. See §4.3.
+3. Roughly how many frames wide is the answer span `[s, e]` for KIS and Q&A?
+   (`CONSTRAINTS.md` R3: the most sensitive hyperparameter in the system.)
+4. For TRAKE, is `N` taken from the labels as written? The mock set numbers one query
+   `E1, E2, E2, E4` — four moments, three distinct labels. We submit four frames.
+5. Is a `frame_id` the **video frame index** (`floor(pts_time * fps)` from `map-keyframes`) rather
+   than the keyframe ordinal? The published baseline notebook displays the ordinal, so a team
+   following it submits a different number entirely (`DATA_AUDIT.md` §11).
 
 Generate a sample set to attach to those questions:
 
@@ -77,8 +113,8 @@ Generate a sample set to attach to those questions:
 uv run aic submit-selftest
 ```
 
-It prints three complete sample files (KIS, Q&A, TRAKE) along with the list of assumptions, into
-`data/processed/submissions/_selftest/`.
+It prints three complete sample files (KIS, Q&A, TRAKE) plus the format in use and what is
+still open, into `data/processed/submissions/_selftest/`.
 
 ---
 
@@ -99,6 +135,7 @@ do not, but must be read). The dividing line is one criterion: an error makes th
 | Negative or non-integer `frame_id` | A frame index that does not exist |
 | Missing Q&A `answer` | One of the three conditions is absent |
 | `answer` containing a newline | Breaks the CSV, shifting every following row |
+| `answer` over 100 characters | Over the limit the specification states |
 | Wrong TRAKE moment count `N` | An invalid answer |
 | Two exactly identical rows | One slot wasted for nothing |
 
@@ -108,9 +145,9 @@ do not, but must be read). The dividing line is one criterion: an error makes th
 |---|---|
 | Fewer than 100 rows | The last 50 slots are still worth 0.2 points and cost almost nothing. **Always fill them.** |
 | `frame_id` past the last known frame of the video | Possibly a nonexistent index |
-| `answer` longer than 200 characters | Long answers are easily judged a non-match (R4) |
+| `answer` with leading or trailing whitespace | Whitespace is preserved, so it changes the answer |
 | TRAKE frames not increasing | Moments of an event sequence are normally in temporal order |
-| Filename off the pattern | A naming assumption that needs confirmation |
+| Filename off the pattern | Not the naming the specification shows; the file may be ignored |
 
 ### Reading back from disk, not validating objects in memory
 
@@ -190,4 +227,4 @@ uv run aic check-submission   # final gate: read back from disk and validate
 - [ ] Open one file in an editor and **look at it**: no header row, no stray BOM, Vietnamese
       diacritics rendering correctly
 - [ ] For TRAKE: every row has exactly `N` frames, in increasing order
-- [ ] The `.zip` is flat, with no nested directory
+- [ ] The `.zip` contains a `submission/` directory holding the CSV files
