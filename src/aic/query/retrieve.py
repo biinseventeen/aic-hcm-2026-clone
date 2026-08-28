@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..core.fusion import ChannelResult, reciprocal_rank_fusion, weights_for_query
+from ..core.align import monotonic_align
 from ..data.features import DenseIndex
 from ..index.priors import DomainPrior
 from ..index.shots import ShotTable
@@ -160,7 +161,7 @@ def dense_query_parts(query: ParsedQuery) -> list[str]:
     The original full query remains a separate dense channel, so decomposition
     can add recall but cannot destroy the existing signal.
     """
-    if query.task == "trake" and query.moments:
+    if query.moments:
         raw_parts = query.moments
     else:
         raw_parts = _QUERY_PART_SPLIT.split(query.raw)
@@ -382,6 +383,147 @@ class Retriever:
                 best[shot_id] = sim
         return [shot_id for shot_id, _ in sorted(best.items(), key=lambda kv: -kv[1])[:limit]]
     
+    def _temporal_kis_channel(
+        self,
+        query: ParsedQuery,
+        video_ids: list[str],
+        name: str = "dense_temporal_kis",
+    ) -> tuple[
+        ChannelResult,
+        dict[tuple[str, int], int],
+    ]:
+        """Re-rank likely videos by whether KIS sub-moments occur in order.
+
+        Real KIS queries often describe a short clip as:
+        start moment -> intermediate moment(s) -> end moment.
+
+        Independent dense retrieval throws that ordering away.  This channel
+        keeps the parsed ``query.moments`` separate and uses the same monotonic
+        DP as TRAKE to require t1 < t2 < ... < tN inside one video.
+
+        The channel contributes one representative shot per aligned video,
+        anchored at an actual aligned keyframe.  It does not replace the normal
+        dense channels; RRF treats it as additional evidence.
+        """
+        if query.task != "kis" or len(query.moments) < 2 or not video_ids:
+            return ChannelResult(name=name, ranked=[]), {}
+
+        # Both text towers live in the same CLIP image space.  For every
+        # moment/frame pair we keep the stronger tower score.  This lets
+        # English KIS queries benefit from the English tower while Vietnamese
+        # queries still use the multilingual tower.
+        encoded: list[np.ndarray] = []
+
+        if self.encoder is not None:
+            vectors = np.asarray(
+                self.encoder.encode(query.moments),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if vectors.ndim == 1:
+                vectors = vectors[None, :]
+            encoded.append(vectors)
+
+        if self.encoder_multilingual is not None:
+            vectors = np.asarray(
+                self.encoder_multilingual.encode(query.moments),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if vectors.ndim == 1:
+                vectors = vectors[None, :]
+            encoded.append(vectors)
+
+        if not encoded:
+            return ChannelResult(name=name, ranked=[]), {}
+
+        ranked_with_scores: list[tuple[tuple[str, int], float]] = []
+        anchors: dict[tuple[str, int], int] = {}
+
+        for video_id in video_ids:
+            rows = self.dense.video_rows(video_id)
+            if rows.size < len(query.moments):
+                continue
+
+            # Monotonic DP assumes temporal column order.  Do not rely on the
+            # dense index's storage order; explicitly sort by decoded frame.
+            decoded = [
+                (int(row), int(self.dense.decode(int(row))[2]))
+                for row in rows.tolist()
+            ]
+            decoded.sort(key=lambda item: item[1])
+
+            ordered_rows = np.asarray(
+                [row for row, _frame in decoded],
+                dtype=np.int64,
+            )
+            ordered_frames = [
+                frame for _row, frame in decoded
+            ]
+
+            image_vectors = np.asarray(
+                self.dense.vectors[ordered_rows],
+                dtype=np.float32,
+            )
+
+            # S has shape (N moments, T keyframes).
+            similarity_matrices = [
+                query_vectors @ image_vectors.T
+                for query_vectors in encoded
+            ]
+            similarity = np.maximum.reduce(similarity_matrices)
+
+            try:
+                path = monotonic_align(similarity, delta=1)
+            except ValueError:
+                continue
+
+            # Mean aligned similarity is deliberately simple: ordering is the
+            # new signal here; no tuned bonus/penalty is introduced.
+            score = float(path.total / max(1, path.n))
+
+            # A KIS answer needs one frame, not the whole TRAKE tuple.  Use the
+            # middle aligned moment as the representative temporal anchor.
+            representative = path.indices[len(path.indices) // 2]
+            best_frame = ordered_frames[representative]
+            shot = self.shots.find(video_id, best_frame)
+            if shot is None:
+                continue
+
+            key = (video_id, shot.shot_id)
+            previous = next(
+                (s for k, s in ranked_with_scores if k == key),
+                None,
+            )
+            if previous is None or score > previous:
+                ranked_with_scores.append((key, score))
+                anchors[key] = best_frame
+
+        # Deduplicate keys, retaining their best temporal score.
+        best_by_key: dict[tuple[str, int], float] = {}
+        for key, score in ranked_with_scores:
+            if score > best_by_key.get(key, -2.0):
+                best_by_key[key] = score
+
+        ranked_with_scores = sorted(
+            best_by_key.items(),
+            key=lambda item: -item[1],
+        )[: self.channel_depth]
+
+        surviving = {key for key, _score in ranked_with_scores}
+        anchors = {
+            key: frame
+            for key, frame in anchors.items()
+            if key in surviving
+        }
+
+        return (
+            ChannelResult(
+                name=name,
+                ranked=[key for key, _score in ranked_with_scores],
+                scores={key: score for key, score in ranked_with_scores},
+            ),
+            anchors,
+        )
+
     def _localized_channel(
         self,
         query: ParsedQuery,
@@ -434,16 +576,7 @@ class Retriever:
             )
 
             similarities = image_vectors @ query_vectors.T
-
-            # Hybrid localisation score:
-            # - full-query similarity keeps the whole scene/context coherent
-            # - best-part similarity lets one strong visual clause rescue a frame
-            if similarities.shape[1] > 1:
-                full_score = similarities[:, 0]
-                part_score = similarities[:, 1:].max(axis=1)
-                best_per_frame = 0.65 * full_score + 0.35 * part_score
-            else:
-                best_per_frame = similarities[:, 0]
+            best_per_frame = similarities.max(axis=1)
 
             best_per_shot: dict[int, tuple[float, int]] = {}
 
@@ -682,6 +815,19 @@ class Retriever:
             for item in video_fused[:LOCALIZE_TOP_VIDEOS]
         ]
 
+        temporal, temporal_anchors = self._temporal_kis_channel(
+            query,
+            localize_videos,
+        )
+
+        temporal.weight = channel_weights.get(
+            "dense_temporal_kis",
+            1.0,
+        )
+
+        if temporal.ranked:
+            channels.append(temporal)
+
         localized, localized_anchors = self._localized_channel(
             query,
             localize_videos,
@@ -695,6 +841,12 @@ class Retriever:
 
         if localized.ranked:
             channels.append(localized)
+
+        # Both local channels may know a stronger exact anchor.  Temporal
+        # alignment wins for its own candidate key; otherwise use the ordinary
+        # localizer anchor.
+        all_local_anchors = dict(localized_anchors)
+        all_local_anchors.update(temporal_anchors)
 
         # Final shot-level fusion now includes the locally re-searched shots.
         fused = reciprocal_rank_fusion(
@@ -734,7 +886,7 @@ class Retriever:
                     video_id=video_id,
                     start=shot.start,
                     end=shot.end,
-                    anchor=localized_anchors.get(
+                    anchor=all_local_anchors.get(
                         (video_id, shot_id),
                         (shot.start + shot.end) // 2,
                     ),
