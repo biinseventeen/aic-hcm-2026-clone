@@ -305,52 +305,6 @@ _GENERIC_HEAD_NOUNS = frozenset(
 )
 
 
-# Sparse-query cleanup for English/manual-English inputs.
-# Keep this deterministic and intentionally small: the goal is to remove
-# function words / boilerplate, not to "understand" the query with another model.
-_ENGLISH_STOPWORDS = frozenset(
-    {
-        "a", "an", "the", "and", "or", "but", "if", "then", "than",
-        "in", "on", "at", "to", "from", "of", "for", "with", "without",
-        "into", "inside", "outside", "over", "under", "by", "as",
-        "is", "are", "was", "were", "be", "being", "been",
-        "this", "that", "these", "those", "it", "its",
-        "there", "here", "where", "when", "while",
-        "he", "she", "they", "them", "his", "her", "their",
-        "has", "have", "had", "do", "does", "did",
-        "can", "could", "would", "should", "may", "might", "will",
-        "first", "next", "after", "before", "finally",
-        "scene", "clip", "video", "image", "shows", "showing",
-        "begins", "begin", "starts", "start", "ends", "end",
-        "turn", "including", "total",
-    }
-)
-
-# Vietnamese stopwords / generic narration words that contribute little to BM25.
-_VI_STOPWORDS = frozenset(
-    {
-        "một", "những", "các", "và", "hoặc", "thì", "là", "có", "được",
-        "trong", "ngoài", "trên", "dưới", "với", "vào", "ra", "từ", "đến",
-        "sau", "trước", "đó", "này", "kia", "của", "cho", "đang",
-        "hình", "ảnh", "cảnh", "quay", "đoạn", "clip", "video",
-        "bắt", "đầu", "kết", "thúc", "chuyển", "sang", "sau đó",
-    }
-)
-
-# Generic English nouns often present in AIC queries but weak as sparse evidence.
-_ENGLISH_GENERIC_TERMS = frozenset(
-    {
-        "cooking", "tutorial", "chef", "person", "people",
-        "screen", "lecture", "teacher", "food", "ingredients",
-    }
-)
-
-# Phrase candidates are built from consecutive retained tokens. Two-word phrases
-# are especially useful for BM25 because many visual concepts are compounds:
-# "lime leaves", "green pepper", "soy sauce", "purple shirt", etc.
-_KEYWORD_TOKEN_RE = re.compile(r"[A-Za-zÀ-ỹĐđ0-9]+(?:['’-][A-Za-zÀ-ỹĐđ0-9]+)?")
-
-
 # Temporal markers commonly used by real KIS queries.  KIS remains a KIS task:
 # these are only ordered visual sub-moments used by retrieval/localisation.
 _KIS_TEMPORAL_SPLIT = re.compile(
@@ -363,6 +317,16 @@ _KIS_TEMPORAL_SPLIT = re.compile(
         \b(?:đoạn\s+clip|cảnh\s+quay)\s+kết\s+thúc\s+(?:với|bằng)?\b
         |
         \bkết\s+thúc\s+(?:với|bằng)?\b
+        |
+        # English temporal KIS markers.  The devset/manual translations are
+        # English, so without these the temporal retriever is silently disabled.
+        \b(?:then|after\s+that|afterwards?|subsequently|next|finally)\b
+        |
+        \b(?:the\s+)?(?:scene|clip)\s+(?:then\s+)?(?:cuts?|transitions?)\s+to\b
+        |
+        \b(?:the\s+)?(?:scene|clip)\s+ends?\s+(?:with|on)?\b
+        |
+        \bends?\s+(?:with|on)\b
     )\s*
     """,
     re.IGNORECASE | re.VERBOSE,
@@ -374,7 +338,9 @@ _KIS_START_PREFIX = re.compile(
     (?:
         đoạn\s+clip\s+bắt\s+đầu\s+(?:với|bằng)? |
         cảnh\s+quay\s+bắt\s+đầu\s+(?:với|bằng)? |
-        bắt\s+đầu\s+(?:với|bằng)?
+        bắt\s+đầu\s+(?:với|bằng)? |
+        (?:the\s+)?(?:scene|clip)\s+(?:begins?|starts?)\s+(?:with|on)? |
+        (?:begins?|starts?)\s+(?:with|on)?
     )
     \s*
     """,
@@ -510,74 +476,11 @@ class RuleParser:
 
     @staticmethod
     def _keywords(raw: str, *, max_keywords: int = 24) -> list[str]:
-        """Extract sparse-search terms with lightweight stopword filtering.
-
-        The previous implementation simply returned the first tokens in the
-        sentence, which made English queries spend their BM25 budget on words
-        such as "in", "the", "video", and "including" while dropping the
-        distinctive nouns near the end of the query.
-
-        This remains deterministic and model-free:
-        * remove English/Vietnamese stopwords and generic narration terms;
-        * preserve numbers;
-        * add informative adjacent bigrams before unigrams;
-        * keep source order so named/textual concepts remain stable.
-        """
-        raw_tokens = [
-            match.group(0).casefold()
-            for match in _KEYWORD_TOKEN_RE.finditer(raw)
-        ]
-
-        kept: list[str] = []
-        for token in raw_tokens:
-            if token.isdigit():
-                kept.append(token)
-                continue
-            if len(token) < 2:
-                continue
-            if token in _ENGLISH_STOPWORDS or token in _VI_STOPWORDS:
-                continue
-            kept.append(token)
-
-        # Prefer informative adjacent phrases.  Do not create a phrase across a
-        # removed stopword because that would invent adjacency not present in
-        # the original text.
-        candidates: list[str] = []
-        for left, right in zip(raw_tokens, raw_tokens[1:]):
-            if (
-                left in kept
-                and right in kept
-                and not left.isdigit()
-                and not right.isdigit()
-            ):
-                phrase = f"{left} {right}"
-                # Avoid boilerplate-only compounds such as "cooking tutorial".
-                if not (
-                    left in _ENGLISH_GENERIC_TERMS
-                    and right in _ENGLISH_GENERIC_TERMS
-                ):
-                    candidates.append(phrase)
-
-        # Then add unigrams.  Generic terms are retained only after distinctive
-        # concepts so they cannot consume the whole sparse-query budget.
-        candidates.extend(
-            token for token in kept if token not in _ENGLISH_GENERIC_TERMS
-        )
-        candidates.extend(
-            token for token in kept if token in _ENGLISH_GENERIC_TERMS
-        )
-
-        seen: set[str] = set()
-        keywords: list[str] = []
-        for candidate in candidates:
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            keywords.append(candidate)
-            if len(keywords) >= max_keywords:
-                break
-
-        return keywords
+        counts: dict[str, int] = {}
+        for token in tokenize_vi(raw):
+            if len(token) >= 2 or token.isdigit():
+                counts[token] = counts.get(token, 0) + 1
+        return list(counts)[:max_keywords]
 
     @staticmethod
     def _entities(raw: str, *, max_entities: int = 12) -> list[str]:

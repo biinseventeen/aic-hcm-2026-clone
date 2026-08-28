@@ -553,105 +553,189 @@ class Retriever:
         ChannelResult,
         dict[tuple[str, int], int],
     ]:
-        """Re-search inside likely videos to recover the correct moment.
+        """Re-search inside likely videos with compact multi-clause evidence.
 
-        Use every compatible text tower rather than only the multilingual one.
-        This matters especially for English queries: corpus-wide retrieval may
-        find the correct video with the English CLIP tower, but localisation
-        used to switch back to the multilingual tower and often jump to a
-        completely different moment inside that same video.
+        Inspired by temporal/event retrieval systems from HCMC-AIC 2025:
+        instead of letting one easy clause dominate a frame score, localise a
+        short region that contains evidence for *multiple* query clauses.
 
-        Scores from the towers are comparable because both text encoders are
-        trained to land in the same supplied CLIP image space. For each
-        keyframe we keep the strongest score across query clauses and towers.
+        For each keyframe position we inspect a compact temporal neighbourhood,
+        take the best match for every query clause inside that neighbourhood,
+        then average those clause scores.  This is deliberately softer than
+        monotonic DP: clauses need to co-occur nearby, but they do not need a
+        brittle exact ordering.
+
+        The final anchor is the strongest actual keyframe inside the winning
+        neighbourhood, so downstream P10 keeps a real frame rather than a
+        synthetic midpoint.
         """
         if not video_ids:
             return ChannelResult(name=name, ranked=[]), {}
 
+        # Full query + visual clauses.  dense_query_parts() also works for
+        # non-temporal KIS because it can split long descriptions on punctuation.
         parts = dense_query_parts(query)
+        clause_texts = parts if len(parts) >= 2 else [query.raw]
 
-        tower_batches: list[tuple[object, list[str]]] = []
+        # Keep the full query as a weak global-semantic signal in addition to
+        # clause coverage.
+        full_text = query.english.strip() or query.raw.strip()
+
+        tower_clause_vectors: list[np.ndarray] = []
+        tower_full_vectors: list[np.ndarray] = []
 
         if self.encoder is not None:
-            english_base = query.english.strip() or query.raw.strip()
-            english_texts = [english_base]
-
-            # If raw itself is English (as in the current benchmark), parsed
-            # clauses are useful to the English tower too. If a separate manual
-            # English translation exists, avoid feeding untranslated raw
-            # Vietnamese clauses into the English tower.
-            if not query.english:
-                for part in parts:
-                    if part not in english_texts:
-                        english_texts.append(part)
-
-            tower_batches.append((self.encoder, english_texts))
-
-        if self.encoder_multilingual is not None:
-            multilingual_texts = [query.raw]
-            for part in parts:
-                if part not in multilingual_texts:
-                    multilingual_texts.append(part)
-
-            tower_batches.append(
-                (self.encoder_multilingual, multilingual_texts)
-            )
-
-        if not tower_batches:
-            return ChannelResult(name=name, ranked=[]), {}
-
-        encoded_batches: list[np.ndarray] = []
-
-        for encoder, texts in tower_batches:
+            # When an explicit manual English translation exists, only feed it
+            # to the English tower.  Otherwise raw may already be English.
+            english_clauses = clause_texts if not query.english else [full_text]
             vectors = np.asarray(
-                encoder.encode(texts),  # type: ignore[union-attr]
+                self.encoder.encode(english_clauses),  # type: ignore[union-attr]
                 dtype=np.float32,
             )
             if vectors.ndim == 1:
                 vectors = vectors[None, :]
-            encoded_batches.append(vectors)
+            tower_clause_vectors.append(vectors)
 
-        ranked_with_scores: list[
-            tuple[tuple[str, int], float]
-        ] = []
+            fv = np.asarray(
+                self.encoder.encode([full_text]),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if fv.ndim == 1:
+                fv = fv[None, :]
+            tower_full_vectors.append(fv)
+
+        if self.encoder_multilingual is not None:
+            vectors = np.asarray(
+                self.encoder_multilingual.encode(clause_texts),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if vectors.ndim == 1:
+                vectors = vectors[None, :]
+            tower_clause_vectors.append(vectors)
+
+            fv = np.asarray(
+                self.encoder_multilingual.encode([query.raw]),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if fv.ndim == 1:
+                fv = fv[None, :]
+            tower_full_vectors.append(fv)
+
+        if not tower_clause_vectors:
+            return ChannelResult(name=name, ranked=[]), {}
+
+        # A KIS event is normally a short clip.  We only use this span for
+        # localisation evidence aggregation; unlike the failed bounded-DP
+        # experiment, it does NOT constrain or replace the temporal channel.
+        LOCAL_CONTEXT_FRAMES = 450
+        HALF_CONTEXT = LOCAL_CONTEXT_FRAMES // 2
+
+        ranked_with_scores: list[tuple[tuple[str, int], float]] = []
         anchors: dict[tuple[str, int], int] = {}
 
         for video_id in video_ids:
             rows = self.dense.video_rows(video_id)
-
             if rows.size == 0:
                 continue
 
+            decoded = [
+                (int(row), int(self.dense.decode(int(row))[2]))
+                for row in rows.tolist()
+            ]
+            decoded.sort(key=lambda item: item[1])
+
+            ordered_rows = np.asarray(
+                [row for row, _frame in decoded],
+                dtype=np.int64,
+            )
+            frames = np.asarray(
+                [frame for _row, frame in decoded],
+                dtype=np.int64,
+            )
             image_vectors = np.asarray(
-                self.dense.vectors[rows],
+                self.dense.vectors[ordered_rows],
                 dtype=np.float32,
             )
 
-            per_tower = [
-                (image_vectors @ query_vectors.T).max(axis=1)
-                for query_vectors in encoded_batches
-            ]
-            best_per_frame = np.maximum.reduce(per_tower)
+            # Clause score matrix: (N clauses, T frames), taking the stronger
+            # compatible text tower at each clause/frame pair.
+            clause_matrices: list[np.ndarray] = []
+            for query_vectors in tower_clause_vectors:
+                # If one tower only has the full query (explicit English field),
+                # it is not shape-compatible with the clause set and should not
+                # be mixed as clause evidence.
+                if query_vectors.shape[0] != len(clause_texts):
+                    continue
+                clause_matrices.append(query_vectors @ image_vectors.T)
 
+            if not clause_matrices:
+                # Fallback: one full-query clause.
+                clause_matrices = [
+                    query_vectors @ image_vectors.T
+                    for query_vectors in tower_clause_vectors
+                ]
+
+            clause_scores = np.maximum.reduce(clause_matrices)
+
+            full_matrices = [
+                full_vector @ image_vectors.T
+                for full_vector in tower_full_vectors
+            ]
+            full_scores = np.maximum.reduce(full_matrices).reshape(-1)
+
+            # Score every keyframe as the centre of a compact event region.
+            # coverage = mean over clauses of each clause's strongest evidence
+            # inside the neighbourhood.  This prevents "woman" / "teacher" /
+            # "pan" alone from dominating a long multi-clause description.
+            centre_scores = np.empty(len(frames), dtype=np.float32)
+            centre_anchors = np.empty(len(frames), dtype=np.int64)
+
+            for i, frame in enumerate(frames.tolist()):
+                lo = int(np.searchsorted(
+                    frames,
+                    frame - HALF_CONTEXT,
+                    side="left",
+                ))
+                hi = int(np.searchsorted(
+                    frames,
+                    frame + HALF_CONTEXT,
+                    side="right",
+                ))
+                if hi <= lo:
+                    centre_scores[i] = -2.0
+                    centre_anchors[i] = i
+                    continue
+
+                local_clause = clause_scores[:, lo:hi]
+                per_clause_best = local_clause.max(axis=1)
+                coverage_score = float(per_clause_best.mean())
+
+                local_full = full_scores[lo:hi]
+                local_best_offset = int(np.argmax(local_full))
+                anchor_index = lo + local_best_offset
+                full_score = float(local_full[local_best_offset])
+
+                # Mostly clause coverage, with a small full-query consistency
+                # term to break ties and retain overall semantics.
+                centre_scores[i] = 0.85 * coverage_score + 0.15 * full_score
+                centre_anchors[i] = anchor_index
+
+            # Collapse centres to shots, retaining the best compact-region score
+            # and its strongest real keyframe anchor.
             best_per_shot: dict[int, tuple[float, int]] = {}
 
-            for row, similarity in zip(
-                rows.tolist(),
-                best_per_frame.tolist(),
-                strict=True,
-            ):
-                _video, _n, frame = self.dense.decode(int(row))
-                shot = self.shots.find(video_id, frame)
-
+            for i, score in enumerate(centre_scores.tolist()):
+                anchor_index = int(centre_anchors[i])
+                anchor_frame = int(frames[anchor_index])
+                shot = self.shots.find(video_id, anchor_frame)
                 if shot is None:
                     continue
 
                 previous = best_per_shot.get(shot.shot_id)
-
-                if previous is None or similarity > previous[0]:
+                if previous is None or score > previous[0]:
                     best_per_shot[shot.shot_id] = (
-                        float(similarity),
-                        int(frame),
+                        float(score),
+                        anchor_frame,
                     )
 
             local_top = sorted(
@@ -667,7 +751,6 @@ class Retriever:
         ranked_with_scores.sort(
             key=lambda item: -item[1]
         )
-
         ranked_with_scores = ranked_with_scores[
             : self.channel_depth
         ]
@@ -676,7 +759,6 @@ class Retriever:
             key
             for key, _score in ranked_with_scores
         }
-
         anchors = {
             key: frame
             for key, frame in anchors.items()
