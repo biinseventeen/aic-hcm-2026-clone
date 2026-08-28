@@ -1,0 +1,52 @@
+BLIND SAMPLING — watch the video FIRST, write the query AFTER (weakness E6)
+========================================================================
+
+[KL21-001] L21_V023 frames 18024–18117 (10:00.800–10:03.900, news)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.
+
+[KL22-001] L22_V008 frames 24132–24237 (16:05.280–16:09.480, news)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.
+
+[KL25-001] L25_V014 frames 35741–36003 (19:52.559–20:01.301, education)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.
+
+[KL25-002] L25_V012 frames 1041–1238 (00:41.640–00:49.520, education)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.
+
+[KL25-003] L25_V004 frames 7623–7711 (04:14.354–04:17.291, education)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.
+
+[KL26-001] L26_V259 frames 4597–4797 (03:03.880–03:11.880, cooking)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.
+
+[KL26-002] L26_V102 frames 5745–5974 (03:49.800–03:58.960, cooking)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.
+
+[KL26-003] L26_V280 frames 3679–3833 (02:27.160–02:33.320, cooking)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.
+
+[KL28-001] L28_V019 frames 212–331 (00:08.480–00:13.240, documentary)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.
+
+[KL29-001] L29_V006 frames 11149–11373 (07:25.960–07:34.920, documentary)
+  1. Watch this segment first. Do not imagine a query before watching.
+  2. Write a natural-language description of the event observed.
+  3. Record the frame range [s, e] in which EVERY frame satisfies it.

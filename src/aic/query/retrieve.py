@@ -104,6 +104,56 @@ class RetrievalResult:
         lines.extend(f"  [i] {note}" for note in self.notes)
         return "\n".join(lines)
 
+#Add helper for eng --> vie objects.
+OBJECT_ALIASES = {
+    "phụ nữ": ["woman", "person"],
+    "đàn ông": ["man", "person"],
+    "người": ["person"],
+
+    "xe tải": ["truck"],
+    "xe hơi": ["car"],
+    "ô tô": ["car"],
+    "xe": ["vehicle"],
+
+    "thuyền": ["boat"],
+
+    "đĩa": ["plate"],
+    "dĩa": ["plate"],
+    "tô": ["bowl"],
+    "bát": ["bowl"],
+    "chảo": ["frying pan", "pan"],
+    "nồi": ["pot"],
+
+    "bánh": ["cake"],
+    "cua": ["crab"],
+    "mực": ["squid"],
+
+    "túi": ["bag"],
+    "gói": ["bag", "package"],
+
+    "chai": ["bottle"],
+    "cốc": ["cup"],
+    "ly": ["cup"],
+}
+
+
+def object_query_text(query: ParsedQuery) -> str:
+    """Translate Vietnamese object mentions into OpenImages-style English labels."""
+    raw = query.raw.lower()
+
+    labels: list[str] = []
+
+    # Longest phrases first so "xe tải" is preferred over generic "xe".
+    for phrase, aliases in sorted(
+        OBJECT_ALIASES.items(),
+        key=lambda item: -len(item[0]),
+    ):
+        if phrase in raw:
+            for alias in aliases:
+                if alias not in labels:
+                    labels.append(alias)
+
+    return " ".join(labels)
 
 @dataclass
 class Retriever:
@@ -115,6 +165,7 @@ class Retriever:
     #: Title-only index — the same BM25 machinery over documents that contain nothing but the
     #: video title, so a hit can be trusted far more than one in a YouTube description.
     title: TextIndex | None = None
+    objects: TextIndex | None = None
     encoder: object | None = None
     #: Second text tower in the same image space, covering Vietnamese directly. Optional: when
     #: absent the multilingual channel is simply empty and RRF ignores it.
@@ -299,9 +350,36 @@ class Retriever:
         if self.title is not None:
             channels.append(
                 self._sparse_channel(
-                    query, "sparse_title", index=self.title, query_vector=query_vector
+                    query, "sparse_title",
+                    index=self.title, query_vector=query_vector
                 )
             )
+        if self.objects is not None:
+            object_text = object_query_text(query)
+
+            if object_text:
+                hits = self.objects.search_bm25(
+                    object_text,
+                    top_k=self.channel_depth,
+                    max_terms=self.sparse_max_terms,
+                )
+
+                channels.append(
+                    self._text_hits_to_channel(
+                        hits,
+                        "objects",
+                        index=self.objects,
+                        query_vector=query_vector,
+                    )
+                )
+            else:
+                channels.append(
+                    ChannelResult(
+                        name="objects",
+                        ranked=[],
+                    )
+                )
+        
         channels.append(self._entity_channel(query, "entity_fuzzy", query_vector=query_vector))
 
         channel_weights = weights or weights_for_query(

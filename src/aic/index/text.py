@@ -47,12 +47,13 @@ __all__ = [
     "char_ngrams",
     "docs_from_media_info",
     "docs_from_titles",
+    "docs_from_objects"
     "normalize_vi",
     "strip_diacritics",
     "tokenize_vi",
 ]
 
-Source = Literal["media-info", "ocr", "asr", "other"]
+Source = Literal["media-info", "ocr", "asr", "objects", "other"]
 
 #: Tokeniser: keep letters (including accented ones) and digits; drop punctuation.
 _TOKEN_RE = re.compile(r"[0-9\w]+", re.UNICODE)
@@ -448,4 +449,106 @@ def docs_from_media_info(
                 end=(last_frames or {}).get(video_id, 0),
             )
         )
+    return docs
+
+
+def docs_from_objects(
+    object_source,
+    keyframe_tables,
+    *,
+    min_score: float = 0.20,
+    max_labels: int = 20,
+) -> list[TextDoc]:
+    """Build frame-level text documents from organiser-supplied object detections.
+
+    Each ``objects/<video>/<n>.json`` file belongs to keyframe ordinal ``n``.
+    ``n`` is mapped back to the organiser's scoring ``frame_idx`` through the
+    corresponding :class:`KeyframeTable`.
+
+    Only detections whose confidence is at least ``min_score`` are kept.
+    Repeated detections of the same class within one keyframe are collapsed
+    to one label, retaining the highest confidence.
+
+    The resulting documents are frame-level rather than video-level, so a
+    retrieval hit points directly at the neighbourhood of the detected object.
+    """
+    docs: list[TextDoc] = []
+
+    for key in object_source:
+        # Expected form: L21_V001/001.json
+        parts = key.replace("\\", "/").split("/")
+
+        if len(parts) < 2:
+            continue
+
+        video_id = parts[-2]
+        filename = parts[-1]
+
+        try:
+            n = int(Path(filename).stem)
+        except ValueError:
+            continue
+
+        table = keyframe_tables.get(video_id)
+
+        if table is None:
+            continue
+
+        try:
+            frame_idx = table.frame_of_n(n)
+        except (IndexError, ValueError):
+            continue
+
+        try:
+            payload = json.loads(object_source.read_text(key))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+
+        labels = payload.get("detection_class_entities") or []
+        scores = payload.get("detection_scores") or []
+
+        # Keep the strongest occurrence of each label.
+        best: dict[str, float] = {}
+
+        for label, raw_score in zip(labels, scores, strict=False):
+            label = str(label).strip()
+
+            if not label:
+                continue
+
+            try:
+                score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+
+            if score < min_score:
+                continue
+
+            previous = best.get(label)
+
+            if previous is None or score > previous:
+                best[label] = score
+
+        if not best:
+            continue
+
+        ranked_labels = [
+            label
+            for label, _score in sorted(
+                best.items(),
+                key=lambda item: -item[1],
+            )[:max_labels]
+        ]
+
+        docs.append(
+            TextDoc(
+                doc_id=len(docs),
+                video_id=video_id,
+                text=" ".join(ranked_labels),
+                source="objects",
+                start=frame_idx,
+                end=frame_idx,
+            )
+        )
+
     return docs

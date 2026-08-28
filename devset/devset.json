@@ -1,0 +1,153 @@
+{
+  "_instructions": [
+    "Watch the video segment FIRST, then write the query. Never the reverse (E6).",
+    "Narrow 'span' to the range in which every frame satisfies the description.",
+    "TRAKE: each moment needs a span UNDER 10 FRAMES wide.",
+    "Cannot write a natural query? Move the target to 'skipped' with a reason."
+  ],
+  "queries": {
+    "KL21-001": "Một gói nilon chứa các hạt tròn màu nâu nằm cạnh một gói nilon khác có giấy ghi chữ \"Thuốc gia truyền trợ thận hoàn\".",
+    "KL22-001": "Cảnh quay bắt đầu bằng hình ảnh một cột mốc giới bị gãy. Sau đó cảnh quay đột ngột chuyển sang một chiếc xe tải bị hư hỏng nặng ở phần đầu, khả năng là do tai nạn.",
+    "KL25-001": "Hình ảnh một phần của đề thi môn Vật lý, tiêu đề \"Đề QG-2019 (NHÓM 2)\", có 4 câu hỏi, đáp án 3 câu đầu được bôi vàng và khoanh tròn bằng màu đỏ.",
+    "KL25-002": "Một thầy giáo tên \"Võ Thanh Bình\" mặc áo sơ mi tím đang giảng bài. Màn hình bài giảng hiện một cánh đồng lúa, góc trái chính giữa màn hình có chữ \"SINH THÁI HỌC\".",
+    "KL25-003": "Màn hình bài giảng về chủ đề điện phân. Bên trái là các phương trình hóa học, bên phải là sơ đồ điện dung dịch được minh họa. Có một chiếc máy màu xanh góc bên phải và một cốc dung dịch màu xanh nhạt trong hình.",
+    "KL26-001": "Cảnh quay bắt đầu với mực ở trong tô. Sau đó có một gói bột chiên giòn được đổ ra dĩa, có tay lấy mực lăn qua bột. Cảnh quay kết thúc bằng việc đầu bếp cho nhân vào giữa miếng mực.",
+    "KL26-002": "Cảnh quay bắt đầu bằng một đĩa chỉ có đồ trang trí. Sau đó một chiếc bánh được đặt giữa dĩa, sau đó có sốt kem được cho lên trên bánh.",
+    "KL26-003": "Cảnh quay bắt đầu bằng việc một thìa nước tương được cho vào chảo đồ ăn có cơm. Cảnh quay chuyển sang quay cận chảo đồ ăn với các màu nâu, đỏ, xanh lá, sau đó kết thúc bằng hình ảnh 2 người đầu bếp, 1 nam 1 nữ đang nấu ăn.",
+    "KL28-001": "Bản đồ cho thấy một phần nước Việt Nam, sau đó chuyển sang hình ảnh thuyền trên sông lúc hoàng hôn, bên phải là dòng chữ \"Những cung đường mà sông đi qua\".",
+    "KL29-001": "Cảnh quay bắt đầu bằng một bàn tay cho cua từ một chiếc rổ màu vàng vào một thùng. Nước sau đó được cho vào thùng này. Cảnh quay kết thúc bằng hình ảnh một người phụ nữ mặc áo họa tiết hoa đang nói chuyện."
+  },
+  "truths": {
+    "KL21-001": {
+      "query_id": "KL21-001",
+      "task": "kis",
+      "video_id": "L21_V023",
+      "span": [
+        18024,
+        18117
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 10:00.800–10:03.900 (news)"
+    },
+    "KL22-001": {
+      "query_id": "KL22-001",
+      "task": "kis",
+      "video_id": "L22_V008",
+      "span": [
+        24132,
+        24237
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 16:05.280–16:09.480 (news)"
+    },
+    "KL25-001": {
+      "query_id": "KL25-001",
+      "task": "kis",
+      "video_id": "L25_V014",
+      "span": [
+        35741,
+        36003
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 19:52.559–20:01.301 (education)"
+    },
+    "KL25-002": {
+      "query_id": "KL25-002",
+      "task": "kis",
+      "video_id": "L25_V012",
+      "span": [
+        1041,
+        1238
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 00:41.640–00:49.520 (education)"
+    },
+    "KL25-003": {
+      "query_id": "KL25-003",
+      "task": "kis",
+      "video_id": "L25_V004",
+      "span": [
+        7623,
+        7711
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 04:14.354–04:17.291 (education)"
+    },
+    "KL26-001": {
+      "query_id": "KL26-001",
+      "task": "kis",
+      "video_id": "L26_V259",
+      "span": [
+        4597,
+        4797
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 03:03.880–03:11.880 (cooking)"
+    },
+    "KL26-002": {
+      "query_id": "KL26-002",
+      "task": "kis",
+      "video_id": "L26_V102",
+      "span": [
+        5745,
+        5974
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 03:49.800–03:58.960 (cooking)"
+    },
+    "KL26-003": {
+      "query_id": "KL26-003",
+      "task": "kis",
+      "video_id": "L26_V280",
+      "span": [
+        3679,
+        3833
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 02:27.160–02:33.320 (cooking)"
+    },
+    "KL28-001": {
+      "query_id": "KL28-001",
+      "task": "kis",
+      "video_id": "L28_V019",
+      "span": [
+        212,
+        331
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 00:08.480–00:13.240 (documentary)"
+    },
+    "KL29-001": {
+      "query_id": "KL29-001",
+      "task": "kis",
+      "video_id": "L29_V006",
+      "span": [
+        11149,
+        11373
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 07:25.960–07:34.920 (documentary)"
+    }
+  },
+  "skipped": {}
+}

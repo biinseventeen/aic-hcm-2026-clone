@@ -166,6 +166,7 @@ def weights_for_query(
         "dense_multilingual": 1.0,
         "dense_original": 0.6,
         "sparse_text": 0.8,
+        "objects": 1.0,
         # A title match is curated text with no boilerplate, so it earns the highest weight of
         # any sparse channel: the mock set has queries whose subject is literally the title.
         "sparse_title": 1.4,
