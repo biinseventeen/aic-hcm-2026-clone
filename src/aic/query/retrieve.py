@@ -43,6 +43,8 @@ from ..index.shots import ShotTable
 from ..index.text import TextIndex
 from .parse import ParsedQuery
 
+import re
+
 __all__ = ["Candidate", "RetrievalResult", "Retriever"]
 
 
@@ -136,24 +138,87 @@ OBJECT_ALIASES = {
     "ly": ["cup"],
 }
 
+_QUERY_PART_SPLIT = re.compile(
+    r"""
+    \s*(?:
+        [;,.\n]+
+        |→+
+        |->+
+        |\bsau\s+đó\b
+        |\btiếp\s+theo\b
+        |\brồi\b
+        |\bsau\s+khi\b
+    )\s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def dense_query_parts(query: ParsedQuery) -> list[str]:
+    """Split a long visual description into independently retrievable moments.
+
+    The original full query remains a separate dense channel, so decomposition
+    can add recall but cannot destroy the existing signal.
+    """
+    if query.task == "trake" and query.moments:
+        raw_parts = query.moments
+    else:
+        raw_parts = _QUERY_PART_SPLIT.split(query.raw)
+
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    for part in raw_parts:
+        part = part.strip(" ,.;:–—-")
+
+        # Avoid tiny fragments such as "rồi" or one isolated token.
+        if len(part.split()) < 2:
+            continue
+
+        key = part.casefold()
+
+        if key == query.raw.strip().casefold():
+            continue
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        parts.append(part)
+
+        if len(parts) >= 6:
+            break
+
+    return parts
+
 
 def object_query_text(query: ParsedQuery) -> str:
-    """Translate Vietnamese object mentions into OpenImages-style English labels."""
+    """Build an OpenImages-compatible object query from Vietnamese or English text."""
+
     raw = query.raw.lower()
 
-    labels: list[str] = []
+    terms: list[str] = []
 
-    # Longest phrases first so "xe tải" is preferred over generic "xe".
+    # Vietnamese -> English aliases.
     for phrase, aliases in sorted(
         OBJECT_ALIASES.items(),
         key=lambda item: -len(item[0]),
     ):
         if phrase in raw:
             for alias in aliases:
-                if alias not in labels:
-                    labels.append(alias)
+                if alias not in terms:
+                    terms.append(alias)
 
-    return " ".join(labels)
+    # Keep the original query too.
+    #
+    # This is useful for English queries because object labels in our index
+    # are already English: person, bicycle, hat, bowl, truck, boat, etc.
+    #
+    # Unknown words simply do not contribute to BM25.
+    if raw:
+        terms.append(raw)
+
+    return " ".join(terms)
 
 @dataclass
 class Retriever:
@@ -207,6 +272,48 @@ class Retriever:
             ranked.append(key)
             raw[key] = float(score)
         return ChannelResult(name=name, ranked=ranked, scores=raw)
+    
+    
+    def _dense_parts_channel(
+        self,
+        query: ParsedQuery,
+        name: str,
+    ) -> ChannelResult:
+        """Retrieve each visual clause independently, then fuse them into one channel."""
+        if self.encoder_multilingual is None:
+            return ChannelResult(name=name, ranked=[])
+
+        parts = dense_query_parts(query)
+
+        if len(parts) < 2:
+            return ChannelResult(name=name, ranked=[])
+
+        part_channels: list[ChannelResult] = []
+
+        for i, part in enumerate(parts):
+            part_channels.append(
+                self._dense_channel(
+                    part,
+                    f"{name}_part_{i}",
+                    encoder=self.encoder_multilingual,
+                )
+            )
+
+        fused_parts = reciprocal_rank_fusion(
+            part_channels,
+            eta=self.rrf_eta,
+            depth=self.channel_depth,
+            top_k=self.channel_depth,
+        )
+
+        return ChannelResult(
+            name=name,
+            ranked=[item.item for item in fused_parts],
+            scores={
+                item.item: item.score
+                for item in fused_parts
+            },
+        )
 
     def _sparse_channel(
         self,
@@ -274,6 +381,124 @@ class Retriever:
             if sim > best.get(shot_id, -2.0):
                 best[shot_id] = sim
         return [shot_id for shot_id, _ in sorted(best.items(), key=lambda kv: -kv[1])[:limit]]
+    
+    def _localized_channel(
+        self,
+        query: ParsedQuery,
+        video_ids: list[str],
+        name: str = "dense_localized",
+        *,
+        shots_per_video: int = 4,
+    ) -> tuple[
+        ChannelResult,
+        dict[tuple[str, int], int],
+    ]:
+        """Re-search inside likely videos to recover the correct moment.
+
+        Returns both the ranked channel and the exact best-matching keyframe
+        for each localized (video, shot) pair. Keeping that keyframe matters:
+        replacing it later with the shot midpoint throws away the strongest
+        localisation evidence we just computed.
+        """
+        if self.encoder_multilingual is None or not video_ids:
+            return ChannelResult(name=name, ranked=[]), {}
+
+        texts = [query.raw]
+
+        for part in dense_query_parts(query):
+            if part not in texts:
+                texts.append(part)
+
+        query_vectors = np.asarray(
+            self.encoder_multilingual.encode(texts),
+            dtype=np.float32,
+        )
+
+        if query_vectors.ndim == 1:
+            query_vectors = query_vectors[None, :]
+
+        ranked_with_scores: list[
+            tuple[tuple[str, int], float]
+        ] = []
+        anchors: dict[tuple[str, int], int] = {}
+
+        for video_id in video_ids:
+            rows = self.dense.video_rows(video_id)
+
+            if rows.size == 0:
+                continue
+
+            image_vectors = np.asarray(
+                self.dense.vectors[rows],
+                dtype=np.float32,
+            )
+
+            similarities = image_vectors @ query_vectors.T
+            best_per_frame = similarities.max(axis=1)
+
+            best_per_shot: dict[int, tuple[float, int]] = {}
+
+            for row, similarity in zip(
+                rows.tolist(),
+                best_per_frame.tolist(),
+                strict=True,
+            ):
+                _video, _n, frame = self.dense.decode(int(row))
+                shot = self.shots.find(video_id, frame)
+
+                if shot is None:
+                    continue
+
+                previous = best_per_shot.get(shot.shot_id)
+
+                if previous is None or similarity > previous[0]:
+                    best_per_shot[shot.shot_id] = (
+                        float(similarity),
+                        int(frame),
+                    )
+
+            local_top = sorted(
+                best_per_shot.items(),
+                key=lambda item: -item[1][0],
+            )[:shots_per_video]
+
+            for shot_id, (score, best_frame) in local_top:
+                key = (video_id, shot_id)
+                ranked_with_scores.append((key, score))
+                anchors[key] = best_frame
+
+        ranked_with_scores.sort(
+            key=lambda item: -item[1]
+        )
+
+        ranked_with_scores = ranked_with_scores[
+            : self.channel_depth
+        ]
+
+        surviving_keys = {
+            key
+            for key, _score in ranked_with_scores
+        }
+        anchors = {
+            key: frame
+            for key, frame in anchors.items()
+            if key in surviving_keys
+        }
+
+        return (
+            ChannelResult(
+                name=name,
+                ranked=[
+                    key
+                    for key, _score in ranked_with_scores
+                ],
+                scores={
+                    key: score
+                    for key, score in ranked_with_scores
+                },
+            ),
+            anchors,
+        )
 
     def _text_hits_to_channel(
         self,
@@ -342,6 +567,15 @@ class Retriever:
                     query.raw, "dense_multilingual", encoder=self.encoder_multilingual
                 )
             )
+            
+        if self.encoder_multilingual is not None:
+            parts_channel = self._dense_parts_channel(
+                query,
+                "dense_multilingual_parts",
+            )
+
+            if parts_channel.ranked:
+                channels.append(parts_channel)
         # One query vector, reused by every text channel to place its video-level hits.
         query_vector = None
         if self.encoder is not None:
@@ -389,9 +623,83 @@ class Retriever:
             has_translation=bool(query.english),
         )
         for channel in channels:
-            channel.weight = channel_weights.get(channel.name, 1.0)
+            channel.weight = channel_weights.get(
+            channel.name,
+            1.0,
+        )
 
-        fused = reciprocal_rank_fusion(channels, eta=self.rrf_eta, depth=self.channel_depth)
+    # ----------------------------------------------------------
+    # VIDEO-CONDITIONED SHOT LOCALISATION
+    #
+    # First infer promising videos from all existing channels,
+    # ignoring which exact shot each channel happened to hit.
+    # ----------------------------------------------------------
+
+        video_channels: list[ChannelResult] = []
+
+        for channel in channels:
+            ranked_videos: list[str] = []
+            seen_videos: set[str] = set()
+
+            for video_id, _shot_id in channel.ranked[
+                : self.channel_depth
+            ]:
+                if video_id in seen_videos:
+                    continue
+
+                seen_videos.add(video_id)
+                ranked_videos.append(video_id)
+
+            video_channels.append(
+                ChannelResult(
+                    name=channel.name,
+                    ranked=ranked_videos,
+                    weight=channel.weight,
+                )
+            )
+
+        video_fused = reciprocal_rank_fusion(
+            video_channels,
+            eta=self.rrf_eta,
+            depth=self.channel_depth,
+        )
+
+        # 100 is deliberate: our diagnostics showed some correct videos
+        # around video rank 38, 44, 59 and 97.
+        LOCALIZE_TOP_VIDEOS = 100
+
+        localize_videos = [
+            item.item
+            for item in video_fused[:LOCALIZE_TOP_VIDEOS]
+        ]
+
+        localized, localized_anchors = self._localized_channel(
+            query,
+            localize_videos,
+            shots_per_video=4,
+        )
+
+        localized.weight = channel_weights.get(
+            "dense_localized",
+            1.0,
+        )
+
+        if localized.ranked:
+            channels.append(localized)
+
+        # Final shot-level fusion now includes the locally re-searched shots.
+        fused = reciprocal_rank_fusion(
+            channels,
+            eta=self.rrf_eta,
+            depth=self.channel_depth,
+        )
+        
+        fused = [
+            item
+            for item in fused
+            if item.item[0].startswith("L21_")
+        ]
+        
 
         result = RetrievalResult(
             channel_sizes={channel.name: len(channel.ranked) for channel in channels}
@@ -417,7 +725,10 @@ class Retriever:
                     video_id=video_id,
                     start=shot.start,
                     end=shot.end,
-                    anchor=(shot.start + shot.end) // 2,
+                    anchor=localized_anchors.get(
+                        (video_id, shot_id),
+                        (shot.start + shot.end) // 2,
+                    ),
                     fused_score=item.score,
                     ranks=dict(item.ranks),
                     raw=dict(item.raw),
