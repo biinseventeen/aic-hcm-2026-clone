@@ -391,6 +391,7 @@ class Retriever:
     ) -> tuple[
         ChannelResult,
         dict[tuple[str, int], int],
+        dict[tuple[str, int], tuple[int, int]],
     ]:
         """Re-rank likely videos by whether KIS sub-moments occur in order.
 
@@ -406,7 +407,7 @@ class Retriever:
         dense channels; RRF treats it as additional evidence.
         """
         if query.task != "kis" or len(query.moments) < 2 or not video_ids:
-            return ChannelResult(name=name, ranked=[]), {}
+            return ChannelResult(name=name, ranked=[]), {}, {}
 
         # Both text towers live in the same CLIP image space.  For every
         # moment/frame pair we keep the stronger tower score.  This lets
@@ -433,10 +434,11 @@ class Retriever:
             encoded.append(vectors)
 
         if not encoded:
-            return ChannelResult(name=name, ranked=[]), {}
+            return ChannelResult(name=name, ranked=[]), {}, {}
 
         ranked_with_scores: list[tuple[tuple[str, int], float]] = []
         anchors: dict[tuple[str, int], int] = {}
+        spans: dict[tuple[str, int], tuple[int, int]] = {}
 
         for video_id in video_ids:
             rows = self.dense.video_rows(video_id)
@@ -497,6 +499,16 @@ class Retriever:
                 ranked_with_scores.append((key, score))
                 anchors[key] = best_frame
 
+                # Preserve the entire ordered event interval, not only the
+                # representative middle moment.  P10 can then spread answer
+                # frames across "begin -> ... -> end" instead of around one
+                # shot midpoint.
+                first_frame = ordered_frames[path.indices[0]]
+                last_frame = ordered_frames[path.indices[-1]]
+                if first_frame > last_frame:
+                    first_frame, last_frame = last_frame, first_frame
+                spans[key] = (int(first_frame), int(last_frame))
+
         # Deduplicate keys, retaining their best temporal score.
         best_by_key: dict[tuple[str, int], float] = {}
         for key, score in ranked_with_scores:
@@ -514,6 +526,11 @@ class Retriever:
             for key, frame in anchors.items()
             if key in surviving
         }
+        spans = {
+            key: span
+            for key, span in spans.items()
+            if key in surviving
+        }
 
         return (
             ChannelResult(
@@ -522,6 +539,7 @@ class Retriever:
                 scores={key: score for key, score in ranked_with_scores},
             ),
             anchors,
+            spans,
         )
 
     def _localized_channel(
@@ -815,7 +833,7 @@ class Retriever:
             for item in video_fused[:LOCALIZE_TOP_VIDEOS]
         ]
 
-        temporal, temporal_anchors = self._temporal_kis_channel(
+        temporal, temporal_anchors, temporal_spans = self._temporal_kis_channel(
             query,
             localize_videos,
         )
@@ -881,11 +899,15 @@ class Retriever:
             if shot is None:
                 continue
             shots_taken[video_id] = shots_taken.get(video_id, 0) + 1
+            temporal_span = temporal_spans.get((video_id, shot_id))
+            candidate_start = temporal_span[0] if temporal_span is not None else shot.start
+            candidate_end = temporal_span[1] if temporal_span is not None else shot.end
+
             result.candidates.append(
                 Candidate(
                     video_id=video_id,
-                    start=shot.start,
-                    end=shot.end,
+                    start=candidate_start,
+                    end=candidate_end,
                     anchor=all_local_anchors.get(
                         (video_id, shot_id),
                         (shot.start + shot.end) // 2,

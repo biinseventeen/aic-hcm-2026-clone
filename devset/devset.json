@@ -6,16 +6,16 @@
     "Cannot write a natural query? Move the target to 'skipped' with a reason."
   ],
   "queries": {
-    "KL21-001": "Một gói nilon chứa các hạt tròn màu nâu nằm cạnh một gói nilon khác có giấy ghi chữ \"Thuốc gia truyền trợ thận hoàn\".",
-    "KL22-001": "Cảnh quay bắt đầu bằng hình ảnh một cột mốc giới bị gãy. Sau đó cảnh quay đột ngột chuyển sang một chiếc xe tải bị hư hỏng nặng ở phần đầu, khả năng là do tai nạn.",
-    "KL25-001": "Hình ảnh một phần của đề thi môn Vật lý, tiêu đề \"Đề QG-2019 (NHÓM 2)\", có 4 câu hỏi, đáp án 3 câu đầu được bôi vàng và khoanh tròn bằng màu đỏ.",
-    "KL25-002": "Một thầy giáo tên \"Võ Thanh Bình\" mặc áo sơ mi tím đang giảng bài. Màn hình bài giảng hiện một cánh đồng lúa, góc trái chính giữa màn hình có chữ \"SINH THÁI HỌC\".",
-    "KL25-003": "Màn hình bài giảng về chủ đề điện phân. Bên trái là các phương trình hóa học, bên phải là sơ đồ điện dung dịch được minh họa. Có một chiếc máy màu xanh góc bên phải và một cốc dung dịch màu xanh nhạt trong hình.",
-    "KL26-001": "Cảnh quay bắt đầu với mực ở trong tô. Sau đó có một gói bột chiên giòn được đổ ra dĩa, có tay lấy mực lăn qua bột. Cảnh quay kết thúc bằng việc đầu bếp cho nhân vào giữa miếng mực.",
-    "KL26-002": "Cảnh quay bắt đầu bằng một đĩa chỉ có đồ trang trí. Sau đó một chiếc bánh được đặt giữa dĩa, sau đó có sốt kem được cho lên trên bánh.",
-    "KL26-003": "Cảnh quay bắt đầu bằng việc một thìa nước tương được cho vào chảo đồ ăn có cơm. Cảnh quay chuyển sang quay cận chảo đồ ăn với các màu nâu, đỏ, xanh lá, sau đó kết thúc bằng hình ảnh 2 người đầu bếp, 1 nam 1 nữ đang nấu ăn.",
-    "KL28-001": "Bản đồ cho thấy một phần nước Việt Nam, sau đó chuyển sang hình ảnh thuyền trên sông lúc hoàng hôn, bên phải là dòng chữ \"Những cung đường mà sông đi qua\".",
-    "KL29-001": "Cảnh quay bắt đầu bằng một bàn tay cho cua từ một chiếc rổ màu vàng vào một thùng. Nước sau đó được cho vào thùng này. Cảnh quay kết thúc bằng hình ảnh một người phụ nữ mặc áo họa tiết hoa đang nói chuyện."
+    "KL21-001": "A plastic bag containing round brown pellets lies next to another plastic bag with a paper reading \"Thuốc gia truyền trợ thận hoàn\".",
+    "KL22-001": "The scene begins with an image of a broken boundary marker. Then, the scene suddenly cuts to a truck with severe damage to its front, likely due to an accident.",
+    "KL25-001": "An image of a portion of a Physics exam, titled \"Đề QG-2019 (NHÓM 2)\", featuring 4 questions, where the answers to the first 3 questions are highlighted in yellow and circled in red.",
+    "KL25-002": "A male teacher named \"Võ Thanh Bình\" wearing a purple shirt is giving a lecture. The lecture screen displays a rice field, and in the middle-left of the screen, there is the text \"SINH THÁI HỌC\".",
+    "KL25-003": "A lecture screen about electrolysis. On the left are chemical equations, and on the right is an illustrated diagram of solution electrolysis. There is a blue machine in the right corner and a beaker of pale blue solution in the image.",
+    "KL26-001": "The scene begins with squid in a bowl. Then a packet of crispy frying flour is poured onto a plate, and a hand takes the squid and rolls it in the flour. The scene ends with the chef putting the filling into the middle of the squid piece.",
+    "KL26-002": "The scene begins with a plate containing only decorations. Then a cake is placed in the middle of the plate, and after that, cream sauce is poured over the cake.",
+    "KL26-003": "The scene begins with a spoonful of soy sauce being added to a pan of food containing rice. The scene transitions to a close-up of the pan of food featuring brown, red, and green colors, then ends with an image of 2 chefs, 1 male and 1 female, cooking.",
+    "KL28-001": "A map showing a part of Vietnam, then transitioning to an image of boats on a river at sunset, with the text \"Những cung đường mà sông đi qua\" on the right.",
+    "KL29-001": "The scene begins with a hand transferring crabs from a yellow basket into a bucket. Water is then poured into this bucket. The scene ends with an image of a woman wearing a floral-patterned shirt talking."
   },
   "truths": {
     "KL21-001": {
