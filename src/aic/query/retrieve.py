@@ -434,7 +434,16 @@ class Retriever:
             )
 
             similarities = image_vectors @ query_vectors.T
-            best_per_frame = similarities.max(axis=1)
+
+            # Hybrid localisation score:
+            # - full-query similarity keeps the whole scene/context coherent
+            # - best-part similarity lets one strong visual clause rescue a frame
+            if similarities.shape[1] > 1:
+                full_score = similarities[:, 0]
+                part_score = similarities[:, 1:].max(axis=1)
+                best_per_frame = 0.65 * full_score + 0.35 * part_score
+            else:
+                best_per_frame = similarities[:, 0]
 
             best_per_shot: dict[int, tuple[float, int]] = {}
 
@@ -694,11 +703,11 @@ class Retriever:
             depth=self.channel_depth,
         )
         
-        fused = [
+        """ fused = [
             item
             for item in fused
             if item.item[0].startswith("L21_")
-        ]
+        ] """
         
 
         result = RetrievalResult(
