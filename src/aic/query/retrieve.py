@@ -743,10 +743,116 @@ class Retriever:
                 key=lambda item: -item[1][0],
             )[:shots_per_video]
 
-            for shot_id, (score, best_frame) in local_top:
+            # --------------------------------------------------------------
+            # P10-only peak-cluster anchor refinement.
+            #
+            # IMPORTANT: local_top, its keys, and its scores are left exactly
+            # unchanged. Therefore this refinement cannot change which video /
+            # shot candidates enter the fusion layer (P8). It only proposes a
+            # better frame anchor for the strongest local candidate in a video.
+            #
+            # We refine only the #1 local shot. The remaining shots keep their
+            # original anchors so downstream frame spread still has diversity.
+            # --------------------------------------------------------------
+            refined_anchor: int | None = None
+
+            if local_top and clause_scores.shape[0] >= 2:
+                TOPK_PER_CLAUSE = 12
+                peak_rows: list[tuple[int, int, float]] = []
+
+                for clause_idx in range(clause_scores.shape[0]):
+                    row = clause_scores[clause_idx]
+                    k = min(TOPK_PER_CLAUSE, row.shape[0])
+                    if k <= 0:
+                        continue
+
+                    if k == row.shape[0]:
+                        top_indices = np.argsort(-row)
+                    else:
+                        partition = np.argpartition(-row, k - 1)[:k]
+                        top_indices = partition[np.argsort(-row[partition])]
+
+                    for frame_index in top_indices.tolist():
+                        peak_rows.append(
+                            (
+                                clause_idx,
+                                int(frame_index),
+                                float(row[frame_index]),
+                            )
+                        )
+
+                best_cluster_score = -float("inf")
+                best_cluster_anchor: int | None = None
+                n_clauses = clause_scores.shape[0]
+
+                for _seed_clause, seed_index, _seed_similarity in peak_rows:
+                    seed_frame = int(frames[seed_index])
+
+                    nearby: dict[int, tuple[float, int]] = {}
+                    for clause_idx, frame_index, similarity in peak_rows:
+                        if (
+                            abs(int(frames[frame_index]) - seed_frame)
+                            > HALF_CONTEXT
+                        ):
+                            continue
+
+                        previous = nearby.get(clause_idx)
+                        if previous is None or similarity > previous[0]:
+                            nearby[clause_idx] = (
+                                float(similarity),
+                                int(frame_index),
+                            )
+
+                    # Require evidence from at least two clauses. A single easy
+                    # object/action must never move the P10 anchor by itself.
+                    if len(nearby) < 2:
+                        continue
+
+                    evidence = np.asarray(
+                        [score for score, _idx in nearby.values()],
+                        dtype=np.float32,
+                    )
+                    coverage = len(nearby) / max(1, n_clauses)
+
+                    support_indices = sorted(
+                        idx for _score, idx in nearby.values()
+                    )
+                    cluster_lo = support_indices[0]
+                    cluster_hi = support_indices[-1]
+
+                    local_full = full_scores[cluster_lo : cluster_hi + 1]
+                    if local_full.size:
+                        offset = int(np.argmax(local_full))
+                        candidate_index = cluster_lo + offset
+                        full_score = float(local_full[offset])
+                    else:
+                        candidate_index = seed_index
+                        full_score = float(full_scores[seed_index])
+
+                    # This score is used ONLY to choose the replacement anchor.
+                    # It never enters ranked_with_scores / RRF.
+                    cluster_score = (
+                        0.75 * float(evidence.mean()) * coverage
+                        + 0.15 * float(evidence.mean())
+                        + 0.10 * full_score
+                    )
+
+                    if cluster_score > best_cluster_score:
+                        best_cluster_score = cluster_score
+                        best_cluster_anchor = int(frames[candidate_index])
+
+                refined_anchor = best_cluster_anchor
+
+            for rank_in_video, (shot_id, (score, best_frame)) in enumerate(
+                local_top
+            ):
                 key = (video_id, shot_id)
                 ranked_with_scores.append((key, score))
-                anchors[key] = best_frame
+
+                if rank_in_video == 0 and refined_anchor is not None:
+                    anchors[key] = refined_anchor
+                else:
+                    anchors[key] = best_frame
 
         ranked_with_scores.sort(
             key=lambda item: -item[1]
