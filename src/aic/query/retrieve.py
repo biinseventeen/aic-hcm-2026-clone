@@ -555,27 +555,61 @@ class Retriever:
     ]:
         """Re-search inside likely videos to recover the correct moment.
 
-        Returns both the ranked channel and the exact best-matching keyframe
-        for each localized (video, shot) pair. Keeping that keyframe matters:
-        replacing it later with the shot midpoint throws away the strongest
-        localisation evidence we just computed.
+        Use every compatible text tower rather than only the multilingual one.
+        This matters especially for English queries: corpus-wide retrieval may
+        find the correct video with the English CLIP tower, but localisation
+        used to switch back to the multilingual tower and often jump to a
+        completely different moment inside that same video.
+
+        Scores from the towers are comparable because both text encoders are
+        trained to land in the same supplied CLIP image space. For each
+        keyframe we keep the strongest score across query clauses and towers.
         """
-        if self.encoder_multilingual is None or not video_ids:
+        if not video_ids:
             return ChannelResult(name=name, ranked=[]), {}
 
-        texts = [query.raw]
+        parts = dense_query_parts(query)
 
-        for part in dense_query_parts(query):
-            if part not in texts:
-                texts.append(part)
+        tower_batches: list[tuple[object, list[str]]] = []
 
-        query_vectors = np.asarray(
-            self.encoder_multilingual.encode(texts),
-            dtype=np.float32,
-        )
+        if self.encoder is not None:
+            english_base = query.english.strip() or query.raw.strip()
+            english_texts = [english_base]
 
-        if query_vectors.ndim == 1:
-            query_vectors = query_vectors[None, :]
+            # If raw itself is English (as in the current benchmark), parsed
+            # clauses are useful to the English tower too. If a separate manual
+            # English translation exists, avoid feeding untranslated raw
+            # Vietnamese clauses into the English tower.
+            if not query.english:
+                for part in parts:
+                    if part not in english_texts:
+                        english_texts.append(part)
+
+            tower_batches.append((self.encoder, english_texts))
+
+        if self.encoder_multilingual is not None:
+            multilingual_texts = [query.raw]
+            for part in parts:
+                if part not in multilingual_texts:
+                    multilingual_texts.append(part)
+
+            tower_batches.append(
+                (self.encoder_multilingual, multilingual_texts)
+            )
+
+        if not tower_batches:
+            return ChannelResult(name=name, ranked=[]), {}
+
+        encoded_batches: list[np.ndarray] = []
+
+        for encoder, texts in tower_batches:
+            vectors = np.asarray(
+                encoder.encode(texts),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if vectors.ndim == 1:
+                vectors = vectors[None, :]
+            encoded_batches.append(vectors)
 
         ranked_with_scores: list[
             tuple[tuple[str, int], float]
@@ -593,8 +627,11 @@ class Retriever:
                 dtype=np.float32,
             )
 
-            similarities = image_vectors @ query_vectors.T
-            best_per_frame = similarities.max(axis=1)
+            per_tower = [
+                (image_vectors @ query_vectors.T).max(axis=1)
+                for query_vectors in encoded_batches
+            ]
+            best_per_frame = np.maximum.reduce(per_tower)
 
             best_per_shot: dict[int, tuple[float, int]] = {}
 
@@ -639,6 +676,7 @@ class Retriever:
             key
             for key, _score in ranked_with_scores
         }
+
         anchors = {
             key: frame
             for key, frame in anchors.items()
