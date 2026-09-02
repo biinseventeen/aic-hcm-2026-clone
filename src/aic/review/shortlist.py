@@ -196,20 +196,32 @@ def _seconds(frame: int, fps: float) -> float:
     return max(0, frame) / fps
 
 
-def _safe_anchor(candidate: Candidate) -> tuple[int, str]:
-    """Return an anchor that is internally consistent with the candidate locus.
+def _raw_anchor(candidate: Candidate) -> int:
+    """Keep retrieval's anchor unchanged.
 
-    A previous retrieval experiment showed that a refined anchor can point to a
-    different shot while the candidate's [start, end] locus is still useful.
-    Changing retrieval itself caused regressions, so review fixes the invariant
-    locally: if anchor is outside the locus, show the locus midpoint instead.
+    Review v3 replaced anchors outside their locus with the midpoint.  That
+    improved internal consistency but regressed a previously useful KL29
+    anchor.  Human review can afford to keep *both* signals instead: raw anchor
+    as one hypothesis and locus representatives as separate hypotheses.
     """
-    start = int(candidate.start)
-    end = int(candidate.end)
-    anchor = int(candidate.anchor)
-    if start <= anchor <= end:
-        return anchor, "anchor"
-    return (start + end) // 2, "locus_mid"
+    return int(candidate.anchor)
+
+
+def _locus_midpoint(candidate: Candidate) -> int:
+    return (int(candidate.start) + int(candidate.end)) // 2
+
+
+def _anchor_inside_locus(candidate: Candidate) -> bool:
+    return int(candidate.start) <= int(candidate.anchor) <= int(candidate.end)
+
+
+def _is_temporal_channel(channel: str) -> bool:
+    lowered = channel.lower()
+    return "temporal" in lowered or "localized" in lowered
+
+
+def _broad_locus(candidate: Candidate, fps: float) -> bool:
+    return int(candidate.end) - int(candidate.start) >= int(round(12.0 * fps))
 
 
 def _probe_to_review(probe: _Probe, fps: float) -> ReviewFrame:
@@ -239,91 +251,139 @@ def _candidate_probe_pool(
     candidates: list[Candidate],
     *,
     fps: float,
-) -> list[_Probe]:
-    """Create evidence points from candidate anchors and broad candidate loci."""
-    pool: list[_Probe] = []
+) -> dict[str, list[_Probe]]:
+    """Build evidence families instead of one flat score-sorted pool.
 
-    for candidate in candidates:
-        safe_anchor, anchor_kind = _safe_anchor(candidate)
-        best_channel_rank = min(candidate.ranks.values()) if candidate.ranks else 10**9
-        pool.append(
+    A flat pool caused the strongest fused anchors to consume every frame
+    budget before channel-specific or broad-locus evidence could be shown.
+    Families let :func:`_review_frames` allocate slots deliberately.
+    """
+    ranked = sorted(
+        candidates,
+        key=lambda c: (
+            -float(c.fused_score),
+            min(c.ranks.values()) if c.ranks else 10**9,
+            int(c.anchor),
+        ),
+    )
+
+    fused: list[_Probe] = []
+    temporal: list[_Probe] = []
+    channels: list[_Probe] = []
+    locus: list[_Probe] = []
+
+    # Raw fused anchors: preserve retrieval behaviour as evidence, even if the
+    # anchor lies outside the candidate locus.
+    for candidate in ranked:
+        fused.append(
             _Probe(
                 candidate=candidate,
-                frame=safe_anchor,
-                kind=anchor_kind,
+                frame=_raw_anchor(candidate),
+                kind=(
+                    "anchor"
+                    if _anchor_inside_locus(candidate)
+                    else "anchor_out"
+                ),
                 priority=(
-                    0,
                     -float(candidate.fused_score),
-                    best_channel_rank,
-                    safe_anchor,
+                    min(candidate.ranks.values()) if candidate.ranks else 10**9,
+                    int(candidate.anchor),
                 ),
             )
         )
 
-        # A broad locus should not be represented by one point.  Probe the
-        # quarter positions.  This is especially useful for temporal candidates
-        # whose locus is correct but whose refined anchor is poor.
-        start = int(candidate.start)
-        end = int(candidate.end)
-        width = end - start
-        if width >= int(round(12.0 * fps)):
-            for q_index, numerator in enumerate((1, 2, 3), 1):
-                frame = start + (width * numerator) // 4
-                pool.append(
-                    _Probe(
-                        candidate=candidate,
-                        frame=frame,
-                        kind=f"locus_q{q_index}",
-                        priority=(
-                            2,
-                            -float(candidate.fused_score),
-                            best_channel_rank,
-                            frame,
-                        ),
-                    )
-                )
-
-    # Each retrieval channel gets to promote its best candidate anchor ahead of
-    # generic locus probes.
-    channels = sorted(
+    channel_names = sorted(
         {
             channel
             for candidate in candidates
             for channel in candidate.ranks
         }
     )
-    for channel in channels:
-        channel_candidates = [
-            candidate
-            for candidate in candidates
-            if channel in candidate.ranks
-        ]
-        if not channel_candidates:
+
+    for channel in channel_names:
+        rows = [candidate for candidate in candidates if channel in candidate.ranks]
+        if not rows:
             continue
         candidate = min(
-            channel_candidates,
+            rows,
             key=lambda c: (
                 int(c.ranks[channel]),
                 -float(c.fused_score),
-                int(c.start),
+                int(c.anchor),
             ),
         )
-        frame, kind = _safe_anchor(candidate)
-        pool.append(
-            _Probe(
-                candidate=candidate,
-                frame=frame,
-                kind=f"{kind}:{channel}",
-                priority=(
-                    1,
-                    int(candidate.ranks[channel]),
-                    -float(candidate.fused_score),
-                    frame,
-                ),
-            )
-        )
 
-    return sorted(pool, key=lambda probe: probe.priority)
+        # For temporal/localized channels, the locus itself is meaningful.  If
+        # the locus is broad, midpoint is a safer human cue than trusting one
+        # refined anchor; the raw anchor remains available in fused evidence.
+        if _is_temporal_channel(channel):
+            frame = (
+                _locus_midpoint(candidate)
+                if _broad_locus(candidate, fps) or not _anchor_inside_locus(candidate)
+                else _raw_anchor(candidate)
+            )
+            temporal.append(
+                _Probe(
+                    candidate=candidate,
+                    frame=frame,
+                    kind=f"temporal:{channel}",
+                    priority=(
+                        int(candidate.ranks[channel]),
+                        -float(candidate.fused_score),
+                        frame,
+                    ),
+                )
+            )
+        else:
+            channels.append(
+                _Probe(
+                    candidate=candidate,
+                    frame=_raw_anchor(candidate),
+                    kind=f"channel:{channel}",
+                    priority=(
+                        int(candidate.ranks[channel]),
+                        -float(candidate.fused_score),
+                        int(candidate.anchor),
+                    ),
+                )
+            )
+
+    # Broad loci get explicit interior probes. Quarter points are particularly
+    # useful when the temporal span is much wider than the true event.
+    broad = sorted(
+        (candidate for candidate in candidates if _broad_locus(candidate, fps)),
+        key=lambda c: (
+            0 if any(_is_temporal_channel(ch) for ch in c.ranks) else 1,
+            -float(c.fused_score),
+            min(c.ranks.values()) if c.ranks else 10**9,
+        ),
+    )
+    for candidate in broad[:4]:
+        start = int(candidate.start)
+        end = int(candidate.end)
+        width = end - start
+        for q_index, numerator in enumerate((1, 2, 3), 1):
+            frame = start + (width * numerator) // 4
+            locus.append(
+                _Probe(
+                    candidate=candidate,
+                    frame=frame,
+                    kind=f"locus_q{q_index}",
+                    priority=(
+                        0 if any(_is_temporal_channel(ch) for ch in candidate.ranks) else 1,
+                        -float(candidate.fused_score),
+                        q_index,
+                        frame,
+                    ),
+                )
+            )
+
+    return {
+        "fused": fused,
+        "temporal": sorted(temporal, key=lambda p: p.priority),
+        "channels": sorted(channels, key=lambda p: p.priority),
+        "locus": sorted(locus, key=lambda p: p.priority),
+    }
 
 
 def _review_frames(
@@ -333,6 +393,19 @@ def _review_frames(
     limit: int,
     min_gap_seconds: float,
 ) -> list[ReviewFrame]:
+    """Allocate a small frame budget across *different evidence types*.
+
+    Slot plan:
+    1. best raw fused anchor (keeps known-good retrieval behaviour);
+    2. best temporal/localized locus representative;
+    3. best independent non-temporal channel;
+    4. broad-locus probe;
+    then repeat remaining evidence by strength.
+
+    Rank >20 videos normally get two slots in v4: one fused cue + one temporal
+    alternative.  This is intentionally more expensive than v3 because a
+    single wrong thumbnail can make a human discard the correct video.
+    """
     if limit <= 0 or not candidates:
         return []
     if min_gap_seconds < 0:
@@ -341,31 +414,50 @@ def _review_frames(
         )
 
     min_gap_frames = int(round(min_gap_seconds * fps))
-    pool = _candidate_probe_pool(candidates, fps=fps)
+    families = _candidate_probe_pool(candidates, fps=fps)
 
     selected: list[_Probe] = []
-    seen: set[tuple[int, int, int, str]] = set()
+    seen_frames: set[int] = set()
 
-    for probe in pool:
-        key = (
-            int(probe.candidate.start),
-            int(probe.candidate.end),
-            int(probe.frame),
-            probe.kind,
-        )
-        if key in seen:
-            continue
-
+    def try_add(probe: _Probe) -> bool:
+        if len(selected) >= limit:
+            return False
+        frame = int(probe.frame)
+        if frame in seen_frames:
+            return False
         if any(
-            abs(int(probe.frame) - int(previous.frame)) < min_gap_frames
+            abs(frame - int(previous.frame)) < min_gap_frames
             for previous in selected
         ):
-            continue
-
+            return False
         selected.append(probe)
-        seen.add(key)
-        if len(selected) >= limit:
-            break
+        seen_frames.add(frame)
+        return True
+
+    def add_first_available(name: str) -> None:
+        for probe in families[name]:
+            if try_add(probe):
+                return
+
+    # Deliberate diversity before score-based filling.
+    add_first_available("fused")
+    if len(selected) < limit:
+        add_first_available("temporal")
+    if len(selected) < limit:
+        add_first_available("channels")
+    if len(selected) < limit:
+        add_first_available("locus")
+
+    # Remaining slots: temporal/locus first, then other channel evidence, then
+    # more fused anchors.  This prevents four near-identical fused peaks.
+    if len(selected) < limit:
+        for family_name in ("temporal", "locus", "channels", "fused"):
+            for probe in families[family_name]:
+                try_add(probe)
+                if len(selected) >= limit:
+                    break
+            if len(selected) >= limit:
+                break
 
     return [_probe_to_review(probe, fps) for probe in selected]
 
@@ -476,8 +568,8 @@ def build_review_shortlist(
     tier1_videos: int = 10,
     tier1_frames: int = 4,
     tier2_videos: int = 20,
-    tier2_frames: int = 2,
-    later_frames: int = 1,
+    tier2_frames: int = 3,
+    later_frames: int = 2,
     min_gap_seconds: float = 8.0,
     default_fps: float = 25.0,
 ) -> ReviewShortlist:
@@ -563,7 +655,7 @@ def build_review_shortlist(
             f"minimum temporal gap={min_gap_seconds:g}s"
         ),
         "display order is video-first round-robin: one frame per video before temporal extras",
-        "anchors outside their own locus are replaced by the locus midpoint only in review",
+        "raw retrieval anchors are preserved; temporal/locus alternatives are shown separately",
         "broad loci (>=12s) contribute quarter-position probes",
         "timestamps are for human review only; submission frame ids are unchanged",
     ]

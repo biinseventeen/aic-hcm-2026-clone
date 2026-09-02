@@ -520,6 +520,12 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
                     gap = frame.frame - span[1]
                 nearest_gap = gap if nearest_gap is None else min(nearest_gap, gap)
 
+            truth_fps = float(engine.fps.get(truth_video, cfg.fps_default))
+            gap_seconds = (
+                (float(nearest_gap) / truth_fps)
+                if nearest_gap is not None and truth_fps > 0
+                else None
+            )
             row = {
                 "query_id": query_id,
                 "video_rank": video_rank,
@@ -528,9 +534,15 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
                 "first_thumbnail": first_thumbnail,
                 "frame_hit": frame_hit,
                 "nearest_frame_gap": nearest_gap,
+                "nearest_gap_seconds": gap_seconds,
+                "near_5s": gap_seconds is not None and gap_seconds <= 5.0,
+                "near_15s": gap_seconds is not None and gap_seconds <= 15.0,
+                "near_30s": gap_seconds is not None and gap_seconds <= 30.0,
+                "near_60s": gap_seconds is not None and gap_seconds <= 60.0,
                 "n_thumbnails": shortlist.n_frames,
             }
             rows.append(row)
+            gap_s_text = "None" if gap_seconds is None else f"{gap_seconds:.1f}s"
             print(
                 f"{query_id:<10} "
                 f"video_rank={str(video_rank):<4} "
@@ -538,7 +550,7 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
                 f"rescued={str(rescued):<5} "
                 f"thumb={str(first_thumbnail):<4} "
                 f"frame_hit={str(frame_hit):<5} "
-                f"gap={nearest_gap}"
+                f"gap={str(nearest_gap):<5} ({gap_s_text})"
             )
     finally:
         engine.close()
@@ -560,6 +572,11 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
         for row in rows
         if row["first_thumbnail"] is not None
     ]
+    shown_gaps = [
+        float(row["nearest_gap_seconds"])
+        for row in rows
+        if row["shown"] and row["nearest_gap_seconds"] is not None
+    ]
 
     print("\n=== HUMAN REVIEW EVALUATION ===")
     for k in (5, 10, 20, 50, 100):
@@ -571,6 +588,16 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
     print(
         f"selected frame inside GT: {frame_hit_count}/{len(rows)} "
         f"({frame_hit_count / len(rows):.1%})"
+    )
+    for seconds, key in ((5, "near_5s"), (15, "near_15s"), (30, "near_30s"), (60, "near_60s")):
+        count = sum(bool(row[key]) for row in rows)
+        print(
+            f"temporal cue <= {seconds:>2}s    : {count}/{len(rows)} "
+            f"({count / len(rows):.1%})"
+        )
+    print(
+        "median nearest gap (shown): "
+        + (f"{median(shown_gaps):.1f}s" if shown_gaps else "n/a")
     )
     print(
         "median thumbnails to truth: "
@@ -588,6 +615,15 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
                 },
                 "truth_video_shown": shown_count,
                 "frame_hits": frame_hit_count,
+                "temporal_cue_within_seconds": {
+                    "5": sum(bool(row["near_5s"]) for row in rows),
+                    "15": sum(bool(row["near_15s"]) for row in rows),
+                    "30": sum(bool(row["near_30s"]) for row in rows),
+                    "60": sum(bool(row["near_60s"]) for row in rows),
+                },
+                "median_nearest_gap_seconds_shown": (
+                    median(shown_gaps) if shown_gaps else None
+                ),
                 "median_thumbnails_to_truth": (
                     median(thumbnails) if thumbnails else None
                 ),
@@ -861,11 +897,11 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--tier1-videos", type=int, default=10)
     review.add_argument("--tier1-frames", type=int, default=4)
     review.add_argument("--tier2-videos", type=int, default=20)
-    review.add_argument("--tier2-frames", type=int, default=2)
+    review.add_argument("--tier2-frames", type=int, default=3)
     review.add_argument(
         "--later-frames",
         type=int,
-        default=1,
+        default=2,
         help="frames for rank > tier2 and channel-rescued videos",
     )
     review.add_argument(
@@ -931,8 +967,8 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_review.add_argument("--tier1-videos", type=int, default=10)
     evaluate_review.add_argument("--tier1-frames", type=int, default=4)
     evaluate_review.add_argument("--tier2-videos", type=int, default=20)
-    evaluate_review.add_argument("--tier2-frames", type=int, default=2)
-    evaluate_review.add_argument("--later-frames", type=int, default=1)
+    evaluate_review.add_argument("--tier2-frames", type=int, default=3)
+    evaluate_review.add_argument("--later-frames", type=int, default=2)
     evaluate_review.add_argument("--min-gap-seconds", type=float, default=8.0)
     evaluate_review.add_argument("--allow-stub", action="store_true")
 

@@ -458,8 +458,8 @@ class Engine:
         tier1_videos: int = 10,
         tier1_frames: int = 4,
         tier2_videos: int = 20,
-        tier2_frames: int = 2,
-        later_frames: int = 1,
+        tier2_frames: int = 3,
+        later_frames: int = 2,
         min_gap_seconds: float = 8.0,
     ) -> ReviewResult:
         """Build a human-review shortlist from the shared retrieval core.
