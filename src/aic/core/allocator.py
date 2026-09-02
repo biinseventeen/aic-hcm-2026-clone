@@ -231,8 +231,14 @@ def allocate_kis(
     *,
     budget: int = MAX_ANSWERS,
     normalize: bool = True,
+    seed_candidates: Sequence[FrameCandidate] = (),
 ) -> AllocationTrace:
-    """Greedy coverage for Textual KIS, using lazy greedy."""
+    """Greedy coverage for Textual KIS, using lazy greedy.
+
+    ``seed_candidates`` are optional forced early picks. They are added to the
+    coverage state before normal greedy allocation continues, so subsequent
+    marginal gains are computed against the already-seeded selection.
+    """
     if budget < 1:
         raise ValueError(f"budget must be >= 1, got {budget}")
     if budget > MAX_ANSWERS:
@@ -253,34 +259,74 @@ def allocate_kis(
         return trace.finalize()
 
     selection: dict[str, list[int]] = {}
-    # The heap holds (-stale_gain, -score, stable_order, key). The initial gains are
-    # computed against the empty set, which is the tightest upper bound submodularity
-    # allows.
-    #
-    # The tie-break key is ``-score``, not insertion order. This is *required*: frames at
-    # least L apart cover exactly L start positions each, so their marginal gains are
-    # exactly equal and ties occur constantly. If insertion order decided them, slot 1
-    # would land on an arbitrary frame inside the locus instead of the anchor frame,
-    # violating H3 and skewing the whole covering sequence behind it. Measured effect:
-    # 0.04 % of total coverage on random data.
+    cumulative = 0.0
+
+    # Optional forced coverage floor. Seeds are accounted for by the coverage
+    # model before greedy allocation begins, so later marginal gains remain valid.
+    seeded = 0
+
+    for seed in seed_candidates:
+        if seeded >= budget:
+            break
+
+        key = seed.key()
+        candidate = pool.pop(key, None)
+
+        # Ignore duplicate / unavailable seeds gracefully.
+        if candidate is None:
+            continue
+
+        gain = coverage.marginal_gain(
+            selection,
+            candidate.video_id,
+            candidate.frame_id,
+        )
+
+        selection.setdefault(candidate.video_id, []).append(candidate.frame_id)
+
+        cumulative += gain
+        seeded += 1
+
+        trace.allocations.append(
+            Allocation(
+                rank=seeded,
+                video_id=candidate.video_id,
+                frame_id=candidate.frame_id,
+                gain=gain,
+                cumulative=min(1.0, cumulative),
+                source=f"{candidate.source}|video-floor",
+            )
+        )
+
+    # The heap holds (-stale_gain, -score, stable_order, key). Initial gains are
+    # computed against the current selection (including any seeded candidates).
     heap: list[tuple[float, float, int, tuple[str, int]]] = []
     order = {key: i for i, key in enumerate(pool)}
+
     for key, candidate in pool.items():
-        gain = coverage.marginal_gain(selection, candidate.video_id, candidate.frame_id)
+        gain = coverage.marginal_gain(
+            selection,
+            candidate.video_id,
+            candidate.frame_id,
+        )
         heap.append((-gain, -candidate.score, order[key], key))
+
     heapq.heapify(heap)
 
-    cumulative = 0.0
-    for rank in range(1, budget + 1):
+    for rank in range(seeded + 1, budget + 1):
         picked = _pick_next(
             heap,
             gain_of=lambda key: coverage.marginal_gain(
-                selection, pool[key].video_id, pool[key].frame_id
+                selection,
+                pool[key].video_id,
+                pool[key].frame_id,
             ),
             score_of=lambda key: pool[key].score,
             trace=trace,
         )
+
         chosen, chosen_gain = picked if picked is not None else (None, 0.0)
+
         if chosen is None:
             trace.exhausted_at = rank
             trace.notes.append(
@@ -289,9 +335,12 @@ def allocate_kis(
                 "all 100 slots (H4)."
             )
             break
+
         candidate = pool.pop(chosen)
         selection.setdefault(candidate.video_id, []).append(candidate.frame_id)
+
         cumulative += chosen_gain
+
         trace.allocations.append(
             Allocation(
                 rank=rank,
@@ -302,6 +351,7 @@ def allocate_kis(
                 source=candidate.source,
             )
         )
+
     return trace.finalize()
 
 

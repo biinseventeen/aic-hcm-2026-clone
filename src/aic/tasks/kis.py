@@ -167,18 +167,23 @@ def solve_kis(
 ) -> KisSolution:
     """Solve one Textual KIS query end to end from a retrieval result."""
     beliefs = build_beliefs(
-        result, fps_by_video=fps_by_video, pad_seconds=pad_seconds, max_frames=max_frames
+        result,
+        fps_by_video=fps_by_video,
+        pad_seconds=pad_seconds,
+        max_frames=max_frames,
     )
     if not beliefs:
         return KisSolution(
             submission=QuerySubmission(query_id, "kis", []),
             trace=AllocationTrace(notes=["no candidates — the retrieval layer failed"]),
         )
+
     anchors: dict[str, int] = {}
     for candidate in sorted(result.candidates, key=lambda c: -c.fused_score):
         anchors.setdefault(candidate.video_id, candidate.anchor)
 
     model = CoverageModel.from_beliefs(beliefs, answer_len=answer_len)
+
     pool = build_frame_pool(
         beliefs,
         answer_len=answer_len,
@@ -186,11 +191,110 @@ def solve_kis(
         max_frames=max_frames,
         budget=budget,
     )
-    trace = allocate_kis(model, pool, budget=min(budget, len(pool)))
+
+    # ------------------------------------------------------------------
+    # Localisation-aware seed policy
+    #
+    # A candidate that survived the dedicated ``dense_localized`` channel
+    # carries stronger *where-inside-the-video* evidence than a generic
+    # representative frame chosen only from pi_v. Preserve a small number
+    # of those exact localized anchors before greedy coverage concentrates
+    # the remaining budget on a handful of videos.
+    #
+    # Keep the total forced-seed budget modest: at most 20 of the 100 rows.
+    # Localized anchors are preferred; any unused seed slots fall back to
+    # the strongest video hypotheses by pi_v.
+    # ------------------------------------------------------------------
+    seed_budget = min(20, budget)
+
+    # Best localized candidate per video, ordered by its rank inside the
+    # dense_localized channel. Lower rank is stronger.
+    localized_by_video: dict[str, Candidate] = {}
+
+    localized_candidates = sorted(
+        (
+            candidate
+            for candidate in result.candidates
+            if "dense_localized" in candidate.ranks
+        ),
+        key=lambda candidate: (
+            candidate.ranks["dense_localized"],
+            -candidate.fused_score,
+        ),
+    )
+
+    for candidate in localized_candidates:
+        localized_by_video.setdefault(candidate.video_id, candidate)
+
+    seed_frames: list[FrameCandidate] = []
+    seeded_videos: set[str] = set()
+
+    # Seed the exact best-matching keyframe found by the localizer.
+    for candidate in localized_by_video.values():
+        if len(seed_frames) >= seed_budget:
+            break
+
+        frame_candidate = FrameCandidate(
+            video_id=candidate.video_id,
+            frame_id=candidate.anchor,
+            score=max(candidate.fused_score, 1e-9),
+            source=f"shot#{candidate.shot_id}@dense-localized-anchor",
+        )
+
+        # allocate_kis() expects every seed key to exist in its candidate pool.
+        # Add the exact localized anchor when frame spreading did not already
+        # generate that precise frame.
+        if not any(existing.key() == frame_candidate.key() for existing in pool):
+            pool.append(frame_candidate)
+
+        seed_frames.append(frame_candidate)
+        seeded_videos.add(candidate.video_id)
+
+    # If fewer than 20 videos have localized evidence, use the remaining
+    # seed slots for the strongest video-level hypotheses.
+    if len(seed_frames) < seed_budget:
+        beliefs_by_pi = sorted(
+            beliefs,
+            key=lambda belief: -belief.pi,
+        )
+
+        best_frame_by_video: dict[str, FrameCandidate] = {}
+        for candidate in pool:
+            previous = best_frame_by_video.get(candidate.video_id)
+            if previous is None or candidate.score > previous.score:
+                best_frame_by_video[candidate.video_id] = candidate
+
+        for belief in beliefs_by_pi:
+            if len(seed_frames) >= seed_budget:
+                break
+            if belief.video_id in seeded_videos:
+                continue
+
+            candidate = best_frame_by_video.get(belief.video_id)
+            if candidate is None:
+                continue
+
+            seed_frames.append(candidate)
+            seeded_videos.add(belief.video_id)
+
+    trace = allocate_kis(
+        model,
+        pool,
+        budget=min(budget, len(pool)),
+        seed_candidates=seed_frames,
+    )
+
+    if seed_frames:
+        trace.notes.append(
+            f"seeded {len(seed_frames)} KIS rows before greedy allocation "
+            f"({len(localized_by_video)} videos had dense_localized evidence)"
+        )
+
     answers = [
         Answer(video_id=allocation.video_id, frame=allocation.frame_id)
         for allocation in trace.allocations
     ]
+
     return KisSolution(
         submission=QuerySubmission(query_id, "kis", answers),
         trace=trace,

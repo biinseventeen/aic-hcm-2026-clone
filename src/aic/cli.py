@@ -106,7 +106,12 @@ def cmd_build_index(args, cfg: Config) -> int:
     from .data.keyframes import load_all_keyframe_tables
     from .data.layout import DataRoot
     from .index.shots import build_shot_table
-    from .index.text import TextIndex, docs_from_media_info, docs_from_titles
+    from .index.text import (
+    TextIndex,
+    docs_from_media_info,
+    docs_from_objects,
+    docs_from_titles,
+)
 
     root = DataRoot(cfg.paths.data_root)
     out = Path(cfg.paths.index_dir)
@@ -151,6 +156,34 @@ def cmd_build_index(args, cfg: Config) -> int:
     text_index.save(out / "text_media.json")
     title_index = TextIndex(docs=docs_from_titles(media_info)).build(verbose=False)
     title_index.save(out / "text_title.json")
+    print("  building object index...")
+
+    object_docs = docs_from_objects(
+        root.objects,
+        tables,
+        min_score=0.20,
+        max_labels=20,
+    )
+
+    if object_docs:
+        object_index = TextIndex(
+            docs=object_docs
+        ).build(
+            with_fuzzy=False,
+            verbose=True,
+        )
+
+        object_index.save(
+            out / "text_objects.json"
+        )
+
+        print(
+            f"  object index: {len(object_index):,} frame-level documents"
+        )
+    else:
+        print(
+            "  [!] object data present but produced no indexable documents"
+        )
     print(f"  title-only index: {len(title_index)} documents (boilerplate-free channel)")
     print(
         "  [!] no OCR and no speech channel yet. Both text retrieval channels are missing — "

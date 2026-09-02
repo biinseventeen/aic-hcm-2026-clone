@@ -305,6 +305,72 @@ _GENERIC_HEAD_NOUNS = frozenset(
 )
 
 
+# Temporal markers commonly used by real KIS queries.  KIS remains a KIS task:
+# these are only ordered visual sub-moments used by retrieval/localisation.
+_KIS_TEMPORAL_SPLIT = re.compile(
+    r"""
+    \s*(?:
+        (?<=\.)\s+
+        |
+        \b(?:sau\s+đó|tiếp\s+theo|rồi|sau\s+khi)\b
+        |
+        \b(?:đoạn\s+clip|cảnh\s+quay)\s+kết\s+thúc\s+(?:với|bằng)?\b
+        |
+        \bkết\s+thúc\s+(?:với|bằng)?\b
+        |
+        # English temporal KIS markers.  The devset/manual translations are
+        # English, so without these the temporal retriever is silently disabled.
+        \b(?:then|after\s+that|afterwards?|subsequently|next|finally)\b
+        |
+        \b(?:the\s+)?(?:scene|clip)\s+(?:then\s+)?(?:cuts?|transitions?)\s+to\b
+        |
+        \b(?:the\s+)?(?:scene|clip)\s+ends?\s+(?:with|on)?\b
+        |
+        \bends?\s+(?:with|on)\b
+    )\s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_KIS_START_PREFIX = re.compile(
+    r"""
+    ^\s*
+    (?:
+        đoạn\s+clip\s+bắt\s+đầu\s+(?:với|bằng)? |
+        cảnh\s+quay\s+bắt\s+đầu\s+(?:với|bằng)? |
+        bắt\s+đầu\s+(?:với|bằng)? |
+        (?:the\s+)?(?:scene|clip)\s+(?:begins?|starts?)\s+(?:with|on)? |
+        (?:begins?|starts?)\s+(?:with|on)?
+    )
+    \s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _split_kis_temporal_moments(raw: str) -> list[str]:
+    """Split a temporal KIS description into ordered visual moments.
+
+    The task stays ``kis``.  These moments are retrieval hints for finding a
+    short ordered segment inside one video, not TRAKE output moments.
+    """
+    cleaned = _KIS_START_PREFIX.sub("", raw.strip())
+
+    parts = [
+        part.strip(" ,.;:–—-")
+        for part in _KIS_TEMPORAL_SPLIT.split(cleaned)
+    ]
+    parts = [part for part in parts if len(part.split()) >= 3]
+
+    # Only call it temporal when the query genuinely decomposes into >=2
+    # meaningful visual clauses.
+    if len(parts) < 2:
+        return []
+
+    # Keep a conservative cap so a verbose query cannot explode retrieval cost.
+    return parts[:6]
+
+
 @dataclass
 class RuleParser:
     """Deterministic parsing, with no dependency on a network or a model.
@@ -341,6 +407,12 @@ class RuleParser:
         # -- moment / question extraction --------------------------------
         if query.task == "trake":
             query.moments = self._split_moments(raw)
+        elif query.task == "kis":
+            # Real KIS queries are often short temporal segment descriptions
+            # ("bắt đầu ... sau đó ... kết thúc ..."). Preserve the task as KIS
+            # but expose ordered sub-moments for temporal retrieval/localisation.
+            query.moments = _split_kis_temporal_moments(raw)
+
         if query.task == "qa":
             query.question = self._extract_question(raw)
 

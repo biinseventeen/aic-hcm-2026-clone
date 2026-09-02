@@ -207,6 +207,7 @@ class Engine:
     text: Any | None
     #: optional title-only sparse index; absent until ``build-index`` has been re-run.
     title: Any | None
+    objects: Any | None
     encoder: Any | None
     #: optional second text tower (multilingual), in the same image space as ``encoder``.
     encoder_multilingual: Any | None
@@ -265,6 +266,19 @@ class Engine:
         title_path = Path(cfg.paths.index_dir) / "text_title.json"
         if title_path.exists():
             title = TextIndex.load(title_path, with_fuzzy=False)
+        
+        objects = None
+        objects_path = Path(cfg.paths.index_dir) / "text_objects.json"
+        
+        if objects_path.exists():
+            objects = TextIndex.load(
+                objects_path,
+                with_fuzzy=False,
+            )
+        else:
+            warnings.append(
+                f"{objects_path.name} is missing - the object retrieval channel will be silent."
+            )
 
         encoder = None
         if need_encoder:
@@ -304,6 +318,7 @@ class Engine:
             shots=shots,
             text=text,
             title=title,
+            objects=objects,
             encoder=encoder,
             encoder_multilingual=encoder_multilingual,
             fps={video_id: table.fps for video_id, table in tables.items()},
@@ -313,6 +328,7 @@ class Engine:
                 shots=shots,
                 text=text,
                 title=title,
+                objects=objects,
                 encoder=encoder,
                 encoder_multilingual=encoder_multilingual,
                 prior=DomainPrior(),

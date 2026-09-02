@@ -1,0 +1,153 @@
+{
+  "_instructions": [
+    "Watch the video segment FIRST, then write the query. Never the reverse (E6).",
+    "Narrow 'span' to the range in which every frame satisfies the description.",
+    "TRAKE: each moment needs a span UNDER 10 FRAMES wide.",
+    "Cannot write a natural query? Move the target to 'skipped' with a reason."
+  ],
+  "queries": {
+    "KL21-001": "A plastic bag containing round brown pellets lies next to another plastic bag with a paper reading \"Thuốc gia truyền trợ thận hoàn\".",
+    "KL22-001": "The scene begins with an image of a broken boundary marker. Then, the scene suddenly cuts to a truck with severe damage to its front, likely due to an accident.",
+    "KL25-001": "An image of a portion of a Physics exam, titled \"Đề QG-2019 (NHÓM 2)\", featuring 4 questions, where the answers to the first 3 questions are highlighted in yellow and circled in red.",
+    "KL25-002": "A male teacher named \"Võ Thanh Bình\" wearing a purple shirt is giving a lecture. The lecture screen displays a rice field, and in the middle-left of the screen, there is the text \"SINH THÁI HỌC\".",
+    "KL25-003": "A lecture screen about electrolysis. On the left are chemical equations, and on the right is an illustrated diagram of solution electrolysis. There is a blue machine in the right corner and a beaker of pale blue solution in the image.",
+    "KL26-001": "The scene begins with squid in a bowl. Then a packet of crispy frying flour is poured onto a plate, and a hand takes the squid and rolls it in the flour. The scene ends with the chef putting the filling into the middle of the squid piece.",
+    "KL26-002": "The scene begins with a plate containing only green and black decorations. Then a cake is placed in the middle of the plate, and after that, cream sauce is poured over the cake.",
+    "KL26-003": "The scene begins with a spoonful of soy sauce being added to a pan of food containing rice. The scene transitions to a close-up of the pan of food featuring brown, red, and green colors, then ends with an image of 2 chefs, 1 male and 1 female, cooking.",
+    "KL28-001": "A map showing a part of Vietnam, then transitioning to an image of boats on a river at sunset, with the text \"Những cung đường mà sông đi qua\" on the right.",
+    "KL29-001": "The scene begins with a hand transferring crabs from a yellow basket into a bucket. Water is then poured into this bucket. The scene ends with an image of a woman wearing a floral-patterned shirt talking."
+  },
+  "truths": {
+    "KL21-001": {
+      "query_id": "KL21-001",
+      "task": "kis",
+      "video_id": "L21_V023",
+      "span": [
+        18024,
+        18117
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 10:00.800–10:03.900 (news)"
+    },
+    "KL22-001": {
+      "query_id": "KL22-001",
+      "task": "kis",
+      "video_id": "L22_V008",
+      "span": [
+        24132,
+        24237
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 16:05.280–16:09.480 (news)"
+    },
+    "KL25-001": {
+      "query_id": "KL25-001",
+      "task": "kis",
+      "video_id": "L25_V014",
+      "span": [
+        35741,
+        36003
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 19:52.559–20:01.301 (education)"
+    },
+    "KL25-002": {
+      "query_id": "KL25-002",
+      "task": "kis",
+      "video_id": "L25_V012",
+      "span": [
+        1041,
+        1238
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 00:41.640–00:49.520 (education)"
+    },
+    "KL25-003": {
+      "query_id": "KL25-003",
+      "task": "kis",
+      "video_id": "L25_V004",
+      "span": [
+        7623,
+        7711
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 04:14.354–04:17.291 (education)"
+    },
+    "KL26-001": {
+      "query_id": "KL26-001",
+      "task": "kis",
+      "video_id": "L26_V259",
+      "span": [
+        4597,
+        4797
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 03:03.880–03:11.880 (cooking)"
+    },
+    "KL26-002": {
+      "query_id": "KL26-002",
+      "task": "kis",
+      "video_id": "L26_V102",
+      "span": [
+        5745,
+        5974
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 03:49.800–03:58.960 (cooking)"
+    },
+    "KL26-003": {
+      "query_id": "KL26-003",
+      "task": "kis",
+      "video_id": "L26_V280",
+      "span": [
+        3679,
+        3833
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 02:27.160–02:33.320 (cooking)"
+    },
+    "KL28-001": {
+      "query_id": "KL28-001",
+      "task": "kis",
+      "video_id": "L28_V019",
+      "span": [
+        212,
+        331
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 00:08.480–00:13.240 (documentary)"
+    },
+    "KL29-001": {
+      "query_id": "KL29-001",
+      "task": "kis",
+      "video_id": "L29_V006",
+      "span": [
+        11149,
+        11373
+      ],
+      "spans": [],
+      "answer": "",
+      "answer_aliases": [],
+      "note": "blind sample 07:25.960–07:34.920 (documentary)"
+    }
+  },
+  "skipped": {}
+}

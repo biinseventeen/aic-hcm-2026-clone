@@ -37,11 +37,14 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..core.fusion import ChannelResult, reciprocal_rank_fusion, weights_for_query
+from ..core.align import monotonic_align
 from ..data.features import DenseIndex
 from ..index.priors import DomainPrior
 from ..index.shots import ShotTable
 from ..index.text import TextIndex
 from .parse import ParsedQuery
+
+import re
 
 __all__ = ["Candidate", "RetrievalResult", "Retriever"]
 
@@ -104,6 +107,119 @@ class RetrievalResult:
         lines.extend(f"  [i] {note}" for note in self.notes)
         return "\n".join(lines)
 
+#Add helper for eng --> vie objects.
+OBJECT_ALIASES = {
+    "phụ nữ": ["woman", "person"],
+    "đàn ông": ["man", "person"],
+    "người": ["person"],
+
+    "xe tải": ["truck"],
+    "xe hơi": ["car"],
+    "ô tô": ["car"],
+    "xe": ["vehicle"],
+
+    "thuyền": ["boat"],
+
+    "đĩa": ["plate"],
+    "dĩa": ["plate"],
+    "tô": ["bowl"],
+    "bát": ["bowl"],
+    "chảo": ["frying pan", "pan"],
+    "nồi": ["pot"],
+
+    "bánh": ["cake"],
+    "cua": ["crab"],
+    "mực": ["squid"],
+
+    "túi": ["bag"],
+    "gói": ["bag", "package"],
+
+    "chai": ["bottle"],
+    "cốc": ["cup"],
+    "ly": ["cup"],
+}
+
+_QUERY_PART_SPLIT = re.compile(
+    r"""
+    \s*(?:
+        [;,.\n]+
+        |→+
+        |->+
+        |\bsau\s+đó\b
+        |\btiếp\s+theo\b
+        |\brồi\b
+        |\bsau\s+khi\b
+    )\s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def dense_query_parts(query: ParsedQuery) -> list[str]:
+    """Split a long visual description into independently retrievable moments.
+
+    The original full query remains a separate dense channel, so decomposition
+    can add recall but cannot destroy the existing signal.
+    """
+    if query.moments:
+        raw_parts = query.moments
+    else:
+        raw_parts = _QUERY_PART_SPLIT.split(query.raw)
+
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    for part in raw_parts:
+        part = part.strip(" ,.;:–—-")
+
+        # Avoid tiny fragments such as "rồi" or one isolated token.
+        if len(part.split()) < 2:
+            continue
+
+        key = part.casefold()
+
+        if key == query.raw.strip().casefold():
+            continue
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        parts.append(part)
+
+        if len(parts) >= 6:
+            break
+
+    return parts
+
+
+def object_query_text(query: ParsedQuery) -> str:
+    """Build an OpenImages-compatible object query from Vietnamese or English text."""
+
+    raw = query.raw.lower()
+
+    terms: list[str] = []
+
+    # Vietnamese -> English aliases.
+    for phrase, aliases in sorted(
+        OBJECT_ALIASES.items(),
+        key=lambda item: -len(item[0]),
+    ):
+        if phrase in raw:
+            for alias in aliases:
+                if alias not in terms:
+                    terms.append(alias)
+
+    # Keep the original query too.
+    #
+    # This is useful for English queries because object labels in our index
+    # are already English: person, bicycle, hat, bowl, truck, boat, etc.
+    #
+    # Unknown words simply do not contribute to BM25.
+    if raw:
+        terms.append(raw)
+
+    return " ".join(terms)
 
 @dataclass
 class Retriever:
@@ -115,6 +231,7 @@ class Retriever:
     #: Title-only index — the same BM25 machinery over documents that contain nothing but the
     #: video title, so a hit can be trusted far more than one in a YouTube description.
     title: TextIndex | None = None
+    objects: TextIndex | None = None
     encoder: object | None = None
     #: Second text tower in the same image space, covering Vietnamese directly. Optional: when
     #: absent the multilingual channel is simply empty and RRF ignores it.
@@ -156,6 +273,48 @@ class Retriever:
             ranked.append(key)
             raw[key] = float(score)
         return ChannelResult(name=name, ranked=ranked, scores=raw)
+    
+    
+    def _dense_parts_channel(
+        self,
+        query: ParsedQuery,
+        name: str,
+    ) -> ChannelResult:
+        """Retrieve each visual clause independently, then fuse them into one channel."""
+        if self.encoder_multilingual is None:
+            return ChannelResult(name=name, ranked=[])
+
+        parts = dense_query_parts(query)
+
+        if len(parts) < 2:
+            return ChannelResult(name=name, ranked=[])
+
+        part_channels: list[ChannelResult] = []
+
+        for i, part in enumerate(parts):
+            part_channels.append(
+                self._dense_channel(
+                    part,
+                    f"{name}_part_{i}",
+                    encoder=self.encoder_multilingual,
+                )
+            )
+
+        fused_parts = reciprocal_rank_fusion(
+            part_channels,
+            eta=self.rrf_eta,
+            depth=self.channel_depth,
+            top_k=self.channel_depth,
+        )
+
+        return ChannelResult(
+            name=name,
+            ranked=[item.item for item in fused_parts],
+            scores={
+                item.item: item.score
+                for item in fused_parts
+            },
+        )
 
     def _sparse_channel(
         self,
@@ -223,6 +382,509 @@ class Retriever:
             if sim > best.get(shot_id, -2.0):
                 best[shot_id] = sim
         return [shot_id for shot_id, _ in sorted(best.items(), key=lambda kv: -kv[1])[:limit]]
+    
+    def _temporal_kis_channel(
+        self,
+        query: ParsedQuery,
+        video_ids: list[str],
+        name: str = "dense_temporal_kis",
+    ) -> tuple[
+        ChannelResult,
+        dict[tuple[str, int], int],
+        dict[tuple[str, int], tuple[int, int]],
+    ]:
+        """Re-rank likely videos by whether KIS sub-moments occur in order.
+
+        Real KIS queries often describe a short clip as:
+        start moment -> intermediate moment(s) -> end moment.
+
+        Independent dense retrieval throws that ordering away.  This channel
+        keeps the parsed ``query.moments`` separate and uses the same monotonic
+        DP as TRAKE to require t1 < t2 < ... < tN inside one video.
+
+        The channel contributes one representative shot per aligned video,
+        anchored at an actual aligned keyframe.  It does not replace the normal
+        dense channels; RRF treats it as additional evidence.
+        """
+        if query.task != "kis" or len(query.moments) < 2 or not video_ids:
+            return ChannelResult(name=name, ranked=[]), {}, {}
+
+        # Both text towers live in the same CLIP image space.  For every
+        # moment/frame pair we keep the stronger tower score.  This lets
+        # English KIS queries benefit from the English tower while Vietnamese
+        # queries still use the multilingual tower.
+        encoded: list[np.ndarray] = []
+
+        if self.encoder is not None:
+            vectors = np.asarray(
+                self.encoder.encode(query.moments),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if vectors.ndim == 1:
+                vectors = vectors[None, :]
+            encoded.append(vectors)
+
+        if self.encoder_multilingual is not None:
+            vectors = np.asarray(
+                self.encoder_multilingual.encode(query.moments),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if vectors.ndim == 1:
+                vectors = vectors[None, :]
+            encoded.append(vectors)
+
+        if not encoded:
+            return ChannelResult(name=name, ranked=[]), {}, {}
+
+        ranked_with_scores: list[tuple[tuple[str, int], float]] = []
+        anchors: dict[tuple[str, int], int] = {}
+        spans: dict[tuple[str, int], tuple[int, int]] = {}
+
+        for video_id in video_ids:
+            rows = self.dense.video_rows(video_id)
+            if rows.size < len(query.moments):
+                continue
+
+            # Monotonic DP assumes temporal column order.  Do not rely on the
+            # dense index's storage order; explicitly sort by decoded frame.
+            decoded = [
+                (int(row), int(self.dense.decode(int(row))[2]))
+                for row in rows.tolist()
+            ]
+            decoded.sort(key=lambda item: item[1])
+
+            ordered_rows = np.asarray(
+                [row for row, _frame in decoded],
+                dtype=np.int64,
+            )
+            ordered_frames = [
+                frame for _row, frame in decoded
+            ]
+
+            image_vectors = np.asarray(
+                self.dense.vectors[ordered_rows],
+                dtype=np.float32,
+            )
+
+            # S has shape (N moments, T keyframes).
+            similarity_matrices = [
+                query_vectors @ image_vectors.T
+                for query_vectors in encoded
+            ]
+            similarity = np.maximum.reduce(similarity_matrices)
+
+            try:
+                path = monotonic_align(similarity, delta=1)
+            except ValueError:
+                continue
+
+            # Mean aligned similarity is deliberately simple: ordering is the
+            # new signal here; no tuned bonus/penalty is introduced.
+            score = float(path.total / max(1, path.n))
+
+            # A KIS answer needs one frame, not the whole TRAKE tuple.  Use the
+            # middle aligned moment as the representative temporal anchor.
+            representative = path.indices[len(path.indices) // 2]
+            best_frame = ordered_frames[representative]
+            shot = self.shots.find(video_id, best_frame)
+            if shot is None:
+                continue
+
+            key = (video_id, shot.shot_id)
+            previous = next(
+                (s for k, s in ranked_with_scores if k == key),
+                None,
+            )
+            if previous is None or score > previous:
+                ranked_with_scores.append((key, score))
+                anchors[key] = best_frame
+
+                # Preserve the entire ordered event interval, not only the
+                # representative middle moment.  P10 can then spread answer
+                # frames across "begin -> ... -> end" instead of around one
+                # shot midpoint.
+                first_frame = ordered_frames[path.indices[0]]
+                last_frame = ordered_frames[path.indices[-1]]
+                if first_frame > last_frame:
+                    first_frame, last_frame = last_frame, first_frame
+                spans[key] = (int(first_frame), int(last_frame))
+
+        # Deduplicate keys, retaining their best temporal score.
+        best_by_key: dict[tuple[str, int], float] = {}
+        for key, score in ranked_with_scores:
+            if score > best_by_key.get(key, -2.0):
+                best_by_key[key] = score
+
+        ranked_with_scores = sorted(
+            best_by_key.items(),
+            key=lambda item: -item[1],
+        )[: self.channel_depth]
+
+        surviving = {key for key, _score in ranked_with_scores}
+        anchors = {
+            key: frame
+            for key, frame in anchors.items()
+            if key in surviving
+        }
+        spans = {
+            key: span
+            for key, span in spans.items()
+            if key in surviving
+        }
+
+        return (
+            ChannelResult(
+                name=name,
+                ranked=[key for key, _score in ranked_with_scores],
+                scores={key: score for key, score in ranked_with_scores},
+            ),
+            anchors,
+            spans,
+        )
+
+    def _localized_channel(
+        self,
+        query: ParsedQuery,
+        video_ids: list[str],
+        name: str = "dense_localized",
+        *,
+        shots_per_video: int = 4,
+    ) -> tuple[
+        ChannelResult,
+        dict[tuple[str, int], int],
+    ]:
+        """Re-search inside likely videos with compact multi-clause evidence.
+
+        Inspired by temporal/event retrieval systems from HCMC-AIC 2025:
+        instead of letting one easy clause dominate a frame score, localise a
+        short region that contains evidence for *multiple* query clauses.
+
+        For each keyframe position we inspect a compact temporal neighbourhood,
+        take the best match for every query clause inside that neighbourhood,
+        then average those clause scores.  This is deliberately softer than
+        monotonic DP: clauses need to co-occur nearby, but they do not need a
+        brittle exact ordering.
+
+        The final anchor is the strongest actual keyframe inside the winning
+        neighbourhood, so downstream P10 keeps a real frame rather than a
+        synthetic midpoint.
+        """
+        if not video_ids:
+            return ChannelResult(name=name, ranked=[]), {}
+
+        # Full query + visual clauses.  dense_query_parts() also works for
+        # non-temporal KIS because it can split long descriptions on punctuation.
+        parts = dense_query_parts(query)
+        clause_texts = parts if len(parts) >= 2 else [query.raw]
+
+        # Keep the full query as a weak global-semantic signal in addition to
+        # clause coverage.
+        full_text = query.english.strip() or query.raw.strip()
+
+        tower_clause_vectors: list[np.ndarray] = []
+        tower_full_vectors: list[np.ndarray] = []
+
+        if self.encoder is not None:
+            # When an explicit manual English translation exists, only feed it
+            # to the English tower.  Otherwise raw may already be English.
+            english_clauses = clause_texts if not query.english else [full_text]
+            vectors = np.asarray(
+                self.encoder.encode(english_clauses),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if vectors.ndim == 1:
+                vectors = vectors[None, :]
+            tower_clause_vectors.append(vectors)
+
+            fv = np.asarray(
+                self.encoder.encode([full_text]),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if fv.ndim == 1:
+                fv = fv[None, :]
+            tower_full_vectors.append(fv)
+
+        if self.encoder_multilingual is not None:
+            vectors = np.asarray(
+                self.encoder_multilingual.encode(clause_texts),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if vectors.ndim == 1:
+                vectors = vectors[None, :]
+            tower_clause_vectors.append(vectors)
+
+            fv = np.asarray(
+                self.encoder_multilingual.encode([query.raw]),  # type: ignore[union-attr]
+                dtype=np.float32,
+            )
+            if fv.ndim == 1:
+                fv = fv[None, :]
+            tower_full_vectors.append(fv)
+
+        if not tower_clause_vectors:
+            return ChannelResult(name=name, ranked=[]), {}
+
+        # A KIS event is normally a short clip.  We only use this span for
+        # localisation evidence aggregation; unlike the failed bounded-DP
+        # experiment, it does NOT constrain or replace the temporal channel.
+        LOCAL_CONTEXT_FRAMES = 450
+        HALF_CONTEXT = LOCAL_CONTEXT_FRAMES // 2
+
+        ranked_with_scores: list[tuple[tuple[str, int], float]] = []
+        anchors: dict[tuple[str, int], int] = {}
+
+        for video_id in video_ids:
+            rows = self.dense.video_rows(video_id)
+            if rows.size == 0:
+                continue
+
+            decoded = [
+                (int(row), int(self.dense.decode(int(row))[2]))
+                for row in rows.tolist()
+            ]
+            decoded.sort(key=lambda item: item[1])
+
+            ordered_rows = np.asarray(
+                [row for row, _frame in decoded],
+                dtype=np.int64,
+            )
+            frames = np.asarray(
+                [frame for _row, frame in decoded],
+                dtype=np.int64,
+            )
+            image_vectors = np.asarray(
+                self.dense.vectors[ordered_rows],
+                dtype=np.float32,
+            )
+
+            # Clause score matrix: (N clauses, T frames), taking the stronger
+            # compatible text tower at each clause/frame pair.
+            clause_matrices: list[np.ndarray] = []
+            for query_vectors in tower_clause_vectors:
+                # If one tower only has the full query (explicit English field),
+                # it is not shape-compatible with the clause set and should not
+                # be mixed as clause evidence.
+                if query_vectors.shape[0] != len(clause_texts):
+                    continue
+                clause_matrices.append(query_vectors @ image_vectors.T)
+
+            if not clause_matrices:
+                # Fallback: one full-query clause.
+                clause_matrices = [
+                    query_vectors @ image_vectors.T
+                    for query_vectors in tower_clause_vectors
+                ]
+
+            clause_scores = np.maximum.reduce(clause_matrices)
+
+            full_matrices = [
+                full_vector @ image_vectors.T
+                for full_vector in tower_full_vectors
+            ]
+            full_scores = np.maximum.reduce(full_matrices).reshape(-1)
+
+            # Score every keyframe as the centre of a compact event region.
+            # coverage = mean over clauses of each clause's strongest evidence
+            # inside the neighbourhood.  This prevents "woman" / "teacher" /
+            # "pan" alone from dominating a long multi-clause description.
+            centre_scores = np.empty(len(frames), dtype=np.float32)
+            centre_anchors = np.empty(len(frames), dtype=np.int64)
+
+            for i, frame in enumerate(frames.tolist()):
+                lo = int(np.searchsorted(
+                    frames,
+                    frame - HALF_CONTEXT,
+                    side="left",
+                ))
+                hi = int(np.searchsorted(
+                    frames,
+                    frame + HALF_CONTEXT,
+                    side="right",
+                ))
+                if hi <= lo:
+                    centre_scores[i] = -2.0
+                    centre_anchors[i] = i
+                    continue
+
+                local_clause = clause_scores[:, lo:hi]
+                per_clause_best = local_clause.max(axis=1)
+                coverage_score = float(per_clause_best.mean())
+
+                local_full = full_scores[lo:hi]
+                local_best_offset = int(np.argmax(local_full))
+                anchor_index = lo + local_best_offset
+                full_score = float(local_full[local_best_offset])
+
+                # Mostly clause coverage, with a small full-query consistency
+                # term to break ties and retain overall semantics.
+                centre_scores[i] = 0.85 * coverage_score + 0.15 * full_score
+                centre_anchors[i] = anchor_index
+
+            # Collapse centres to shots, retaining the best compact-region score
+            # and its strongest real keyframe anchor.
+            best_per_shot: dict[int, tuple[float, int]] = {}
+
+            for i, score in enumerate(centre_scores.tolist()):
+                anchor_index = int(centre_anchors[i])
+                anchor_frame = int(frames[anchor_index])
+                shot = self.shots.find(video_id, anchor_frame)
+                if shot is None:
+                    continue
+
+                previous = best_per_shot.get(shot.shot_id)
+                if previous is None or score > previous[0]:
+                    best_per_shot[shot.shot_id] = (
+                        float(score),
+                        anchor_frame,
+                    )
+
+            local_top = sorted(
+                best_per_shot.items(),
+                key=lambda item: -item[1][0],
+            )[:shots_per_video]
+
+            # --------------------------------------------------------------
+            # P10-only peak-cluster anchor refinement.
+            #
+            # IMPORTANT: local_top, its keys, and its scores are left exactly
+            # unchanged. Therefore this refinement cannot change which video /
+            # shot candidates enter the fusion layer (P8). It only proposes a
+            # better frame anchor for the strongest local candidate in a video.
+            #
+            # We refine only the #1 local shot. The remaining shots keep their
+            # original anchors so downstream frame spread still has diversity.
+            # --------------------------------------------------------------
+            refined_anchor: int | None = None
+
+            if local_top and clause_scores.shape[0] >= 2:
+                TOPK_PER_CLAUSE = 12
+                peak_rows: list[tuple[int, int, float]] = []
+
+                for clause_idx in range(clause_scores.shape[0]):
+                    row = clause_scores[clause_idx]
+                    k = min(TOPK_PER_CLAUSE, row.shape[0])
+                    if k <= 0:
+                        continue
+
+                    if k == row.shape[0]:
+                        top_indices = np.argsort(-row)
+                    else:
+                        partition = np.argpartition(-row, k - 1)[:k]
+                        top_indices = partition[np.argsort(-row[partition])]
+
+                    for frame_index in top_indices.tolist():
+                        peak_rows.append(
+                            (
+                                clause_idx,
+                                int(frame_index),
+                                float(row[frame_index]),
+                            )
+                        )
+
+                best_cluster_score = -float("inf")
+                best_cluster_anchor: int | None = None
+                n_clauses = clause_scores.shape[0]
+
+                for _seed_clause, seed_index, _seed_similarity in peak_rows:
+                    seed_frame = int(frames[seed_index])
+
+                    nearby: dict[int, tuple[float, int]] = {}
+                    for clause_idx, frame_index, similarity in peak_rows:
+                        if (
+                            abs(int(frames[frame_index]) - seed_frame)
+                            > HALF_CONTEXT
+                        ):
+                            continue
+
+                        previous = nearby.get(clause_idx)
+                        if previous is None or similarity > previous[0]:
+                            nearby[clause_idx] = (
+                                float(similarity),
+                                int(frame_index),
+                            )
+
+                    # Require evidence from at least two clauses. A single easy
+                    # object/action must never move the P10 anchor by itself.
+                    if len(nearby) < 2:
+                        continue
+
+                    evidence = np.asarray(
+                        [score for score, _idx in nearby.values()],
+                        dtype=np.float32,
+                    )
+                    coverage = len(nearby) / max(1, n_clauses)
+
+                    support_indices = sorted(
+                        idx for _score, idx in nearby.values()
+                    )
+                    cluster_lo = support_indices[0]
+                    cluster_hi = support_indices[-1]
+
+                    local_full = full_scores[cluster_lo : cluster_hi + 1]
+                    if local_full.size:
+                        offset = int(np.argmax(local_full))
+                        candidate_index = cluster_lo + offset
+                        full_score = float(local_full[offset])
+                    else:
+                        candidate_index = seed_index
+                        full_score = float(full_scores[seed_index])
+
+                    # This score is used ONLY to choose the replacement anchor.
+                    # It never enters ranked_with_scores / RRF.
+                    cluster_score = (
+                        0.75 * float(evidence.mean()) * coverage
+                        + 0.15 * float(evidence.mean())
+                        + 0.10 * full_score
+                    )
+
+                    if cluster_score > best_cluster_score:
+                        best_cluster_score = cluster_score
+                        best_cluster_anchor = int(frames[candidate_index])
+
+                refined_anchor = best_cluster_anchor
+
+            for rank_in_video, (shot_id, (score, best_frame)) in enumerate(
+                local_top
+            ):
+                key = (video_id, shot_id)
+                ranked_with_scores.append((key, score))
+
+                if rank_in_video == 0 and refined_anchor is not None:
+                    anchors[key] = refined_anchor
+                else:
+                    anchors[key] = best_frame
+
+        ranked_with_scores.sort(
+            key=lambda item: -item[1]
+        )
+        ranked_with_scores = ranked_with_scores[
+            : self.channel_depth
+        ]
+
+        surviving_keys = {
+            key
+            for key, _score in ranked_with_scores
+        }
+        anchors = {
+            key: frame
+            for key, frame in anchors.items()
+            if key in surviving_keys
+        }
+
+        return (
+            ChannelResult(
+                name=name,
+                ranked=[
+                    key
+                    for key, _score in ranked_with_scores
+                ],
+                scores={
+                    key: score
+                    for key, score in ranked_with_scores
+                },
+            ),
+            anchors,
+        )
 
     def _text_hits_to_channel(
         self,
@@ -291,6 +953,15 @@ class Retriever:
                     query.raw, "dense_multilingual", encoder=self.encoder_multilingual
                 )
             )
+            
+        if self.encoder_multilingual is not None:
+            parts_channel = self._dense_parts_channel(
+                query,
+                "dense_multilingual_parts",
+            )
+
+            if parts_channel.ranked:
+                channels.append(parts_channel)
         # One query vector, reused by every text channel to place its video-level hits.
         query_vector = None
         if self.encoder is not None:
@@ -299,9 +970,36 @@ class Retriever:
         if self.title is not None:
             channels.append(
                 self._sparse_channel(
-                    query, "sparse_title", index=self.title, query_vector=query_vector
+                    query, "sparse_title",
+                    index=self.title, query_vector=query_vector
                 )
             )
+        if self.objects is not None:
+            object_text = object_query_text(query)
+
+            if object_text:
+                hits = self.objects.search_bm25(
+                    object_text,
+                    top_k=self.channel_depth,
+                    max_terms=self.sparse_max_terms,
+                )
+
+                channels.append(
+                    self._text_hits_to_channel(
+                        hits,
+                        "objects",
+                        index=self.objects,
+                        query_vector=query_vector,
+                    )
+                )
+            else:
+                channels.append(
+                    ChannelResult(
+                        name="objects",
+                        ranked=[],
+                    )
+                )
+        
         channels.append(self._entity_channel(query, "entity_fuzzy", query_vector=query_vector))
 
         channel_weights = weights or weights_for_query(
@@ -311,9 +1009,102 @@ class Retriever:
             has_translation=bool(query.english),
         )
         for channel in channels:
-            channel.weight = channel_weights.get(channel.name, 1.0)
+            channel.weight = channel_weights.get(
+            channel.name,
+            1.0,
+        )
 
-        fused = reciprocal_rank_fusion(channels, eta=self.rrf_eta, depth=self.channel_depth)
+    # ----------------------------------------------------------
+    # VIDEO-CONDITIONED SHOT LOCALISATION
+    #
+    # First infer promising videos from all existing channels,
+    # ignoring which exact shot each channel happened to hit.
+    # ----------------------------------------------------------
+
+        video_channels: list[ChannelResult] = []
+
+        for channel in channels:
+            ranked_videos: list[str] = []
+            seen_videos: set[str] = set()
+
+            for video_id, _shot_id in channel.ranked[
+                : self.channel_depth
+            ]:
+                if video_id in seen_videos:
+                    continue
+
+                seen_videos.add(video_id)
+                ranked_videos.append(video_id)
+
+            video_channels.append(
+                ChannelResult(
+                    name=channel.name,
+                    ranked=ranked_videos,
+                    weight=channel.weight,
+                )
+            )
+
+        video_fused = reciprocal_rank_fusion(
+            video_channels,
+            eta=self.rrf_eta,
+            depth=self.channel_depth,
+        )
+
+        # 100 is deliberate: our diagnostics showed some correct videos
+        # around video rank 38, 44, 59 and 97.
+        LOCALIZE_TOP_VIDEOS = 100
+
+        localize_videos = [
+            item.item
+            for item in video_fused[:LOCALIZE_TOP_VIDEOS]
+        ]
+
+        temporal, temporal_anchors, temporal_spans = self._temporal_kis_channel(
+            query,
+            localize_videos,
+        )
+
+        temporal.weight = channel_weights.get(
+            "dense_temporal_kis",
+            1.0,
+        )
+
+        if temporal.ranked:
+            channels.append(temporal)
+
+        localized, localized_anchors = self._localized_channel(
+            query,
+            localize_videos,
+            shots_per_video=4,
+        )
+
+        localized.weight = channel_weights.get(
+            "dense_localized",
+            1.0,
+        )
+
+        if localized.ranked:
+            channels.append(localized)
+
+        # Both local channels may know a stronger exact anchor.  Temporal
+        # alignment wins for its own candidate key; otherwise use the ordinary
+        # localizer anchor.
+        all_local_anchors = dict(localized_anchors)
+        all_local_anchors.update(temporal_anchors)
+
+        # Final shot-level fusion now includes the locally re-searched shots.
+        fused = reciprocal_rank_fusion(
+            channels,
+            eta=self.rrf_eta,
+            depth=self.channel_depth,
+        )
+        
+        """ fused = [
+            item
+            for item in fused
+            if item.item[0].startswith("L21_")
+        ] """
+        
 
         result = RetrievalResult(
             channel_sizes={channel.name: len(channel.ranked) for channel in channels}
@@ -334,12 +1125,19 @@ class Retriever:
             if shot is None:
                 continue
             shots_taken[video_id] = shots_taken.get(video_id, 0) + 1
+            temporal_span = temporal_spans.get((video_id, shot_id))
+            candidate_start = temporal_span[0] if temporal_span is not None else shot.start
+            candidate_end = temporal_span[1] if temporal_span is not None else shot.end
+
             result.candidates.append(
                 Candidate(
                     video_id=video_id,
-                    start=shot.start,
-                    end=shot.end,
-                    anchor=(shot.start + shot.end) // 2,
+                    start=candidate_start,
+                    end=candidate_end,
+                    anchor=all_local_anchors.get(
+                        (video_id, shot_id),
+                        (shot.start + shot.end) // 2,
+                    ),
                     fused_score=item.score,
                     ranks=dict(item.ranks),
                     raw=dict(item.raw),
