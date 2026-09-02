@@ -488,7 +488,6 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
             first_thumbnail = None
             frame_hit = False
             nearest_gap = None
-            thumbnail_index = 0
 
             span_raw = truth.get("span") or []
             span = None
@@ -499,22 +498,27 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
                 if video.video_id == truth_video:
                     shown = True
                     rescued = video.rescued
-                for frame in video.frames:
-                    thumbnail_index += 1
-                    if video.video_id != truth_video:
-                        continue
-                    if first_thumbnail is None:
-                        first_thumbnail = thumbnail_index
-                    if span is None:
-                        continue
-                    if span[0] <= frame.frame <= span[1]:
-                        gap = 0
-                        frame_hit = True
-                    elif frame.frame < span[0]:
-                        gap = span[0] - frame.frame
-                    else:
-                        gap = frame.frame - span[1]
-                    nearest_gap = gap if nearest_gap is None else min(nearest_gap, gap)
+
+            # Measure the actual human viewing order: one thumbnail from every
+            # video first, then second/third/fourth temporal hypotheses.
+            for thumbnail_index, (video, frame) in enumerate(
+                shortlist.scan_order(),
+                1,
+            ):
+                if video.video_id != truth_video:
+                    continue
+                if first_thumbnail is None:
+                    first_thumbnail = thumbnail_index
+                if span is None:
+                    continue
+                if span[0] <= frame.frame <= span[1]:
+                    gap = 0
+                    frame_hit = True
+                elif frame.frame < span[0]:
+                    gap = span[0] - frame.frame
+                else:
+                    gap = frame.frame - span[1]
+                nearest_gap = gap if nearest_gap is None else min(nearest_gap, gap)
 
             row = {
                 "query_id": query_id,

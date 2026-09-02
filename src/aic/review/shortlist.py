@@ -1,11 +1,18 @@
 """Human-in-the-loop review shortlist.
 
-The automatic solver tries to maximise submission score.  This module has a
-different objective: maximise the chance that a human sees the correct video
-and at least one useful temporal clue with a review budget of roughly 100
-thumbnails.
+The automatic solver maximises submission score.  This module maximises a
+different quantity: how quickly a human can eliminate most of the corpus and
+land on the right video / temporal neighbourhood.
 
-It does not modify retrieval scores and it never calls P10/P13.
+Important rules:
+- retrieval scores are never changed;
+- P10/P13 are never called;
+- a bad candidate anchor is NOT trusted when it lies outside its own locus;
+- broad loci are probed at several positions instead of being represented by
+  one arbitrary anchor;
+- display order is round-robin: first show one frame from every video, then
+  show temporal extras.  This prevents rank-12 from appearing only after a
+  human has inspected 40 thumbnails from ranks 1-10.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ class ReviewFrame:
     shot_id: int = -1
     channels: tuple[str, ...] = ()
     cluster: int = -1
+    kind: str = "anchor"
 
     def to_dict(self) -> dict:
         return {
@@ -47,19 +55,17 @@ class ReviewFrame:
             "shot_id": self.shot_id,
             "channels": list(self.channels),
             "cluster": self.cluster,
+            "kind": self.kind,
         }
 
 
 @dataclass(slots=True, frozen=True)
 class ReviewVideo:
     video_id: str
-    # Rank in the complete video_scores ordering, not rank inside the shortlist.
     rank: int
     video_score: float
     fps: float
     frames: tuple[ReviewFrame, ...]
-    # "global" means the video was already in the normal top-N video ranking.
-    # "channel:<name>" means a single retrieval channel rescued it.
     selection_reason: str = "global"
 
     @property
@@ -91,9 +97,34 @@ class ReviewShortlist:
     def n_rescued_videos(self) -> int:
         return sum(video.rescued for video in self.videos)
 
+    def scan_order(self) -> list[tuple[ReviewVideo, ReviewFrame]]:
+        """Human scan order.
+
+        Pass 1 shows exactly one thumbnail from every video.  Only after that do
+        we spend attention on second/third/fourth temporal hypotheses.  Extras
+        are also round-robin so one video cannot monopolise the screen.
+        """
+        ordered: list[tuple[ReviewVideo, ReviewFrame]] = []
+        max_depth = max((len(video.frames) for video in self.videos), default=0)
+        for depth in range(max_depth):
+            for video in self.videos:
+                if depth < len(video.frames):
+                    ordered.append((video, video.frames[depth]))
+        return ordered
+
     def to_dict(self) -> dict:
+        scan = self.scan_order()
         return {
             "videos": [video.to_dict() for video in self.videos],
+            "scan_order": [
+                {
+                    "scan_rank": index,
+                    "video_id": video.video_id,
+                    "video_rank": video.rank,
+                    "frame": frame.to_dict(),
+                }
+                for index, (video, frame) in enumerate(scan, 1)
+            ],
             "n_videos": len(self.videos),
             "n_frames": self.n_frames,
             "n_rescued_videos": self.n_rescued_videos,
@@ -106,30 +137,57 @@ class ReviewShortlist:
                 f"review shortlist: {len(self.videos)} videos, "
                 f"{self.n_frames} frames, "
                 f"{self.n_rescued_videos} channel-rescued videos"
-            )
+            ),
+            "",
+            "PASS 1 — VIDEO SCAN (one frame per video)",
         ]
 
-        for video in self.videos:
+        for scan_rank, video in enumerate(self.videos, 1):
+            if not video.frames:
+                continue
+            frame = video.frames[0]
             reason = (
                 ""
                 if video.selection_reason == "global"
                 else f"  [{video.selection_reason}]"
             )
             lines.append(
-                f"#{video.rank:<3} {video.video_id:<10} "
-                f"video_score={video.video_score:.4f}  "
-                f"fps={video.fps:g}{reason}"
+                f"{scan_rank:>3}. #{video.rank:<3} {video.video_id:<10} "
+                f"t={frame.timestamp_seconds:8.2f}s "
+                f"frame={frame.frame:<7} "
+                f"score={frame.score:.5f}{reason}"
             )
-            for index, frame in enumerate(video.frames, 1):
+
+        extras = [
+            (video, frame, depth)
+            for depth in range(1, max((len(v.frames) for v in self.videos), default=0))
+            for video in self.videos
+            if depth < len(video.frames)
+            for frame in (video.frames[depth],)
+        ]
+        if extras:
+            lines.extend(["", "PASS 2 — TEMPORAL EXTRAS"])
+            for video, frame, depth in extras:
                 channels = ",".join(frame.channels) if frame.channels else "-"
                 lines.append(
-                    f"    [{index}] frame={frame.frame:<7} "
-                    f"t={frame.timestamp_seconds:8.2f}s  "
-                    f"score={frame.score:.5f}  channels={channels}"
+                    f"  #{video.rank:<3} {video.video_id:<10} "
+                    f"[{depth + 1}] t={frame.timestamp_seconds:8.2f}s "
+                    f"frame={frame.frame:<7} "
+                    f"kind={frame.kind:<10} "
+                    f"window={frame.start_seconds:.2f}-{frame.end_seconds:.2f}s "
+                    f"channels={channels}"
                 )
 
-        lines.extend(f"  [i] {note}" for note in self.notes)
+        lines.extend(["", *[f"  [i] {note}" for note in self.notes]])
         return "\n".join(lines)
+
+
+@dataclass(slots=True, frozen=True)
+class _Probe:
+    candidate: Candidate
+    frame: int
+    kind: str
+    priority: tuple
 
 
 def _seconds(frame: int, fps: float) -> float:
@@ -138,10 +196,27 @@ def _seconds(frame: int, fps: float) -> float:
     return max(0, frame) / fps
 
 
-def _candidate_to_review(candidate: Candidate, fps: float) -> ReviewFrame:
+def _safe_anchor(candidate: Candidate) -> tuple[int, str]:
+    """Return an anchor that is internally consistent with the candidate locus.
+
+    A previous retrieval experiment showed that a refined anchor can point to a
+    different shot while the candidate's [start, end] locus is still useful.
+    Changing retrieval itself caused regressions, so review fixes the invariant
+    locally: if anchor is outside the locus, show the locus midpoint instead.
+    """
+    start = int(candidate.start)
+    end = int(candidate.end)
+    anchor = int(candidate.anchor)
+    if start <= anchor <= end:
+        return anchor, "anchor"
+    return (start + end) // 2, "locus_mid"
+
+
+def _probe_to_review(probe: _Probe, fps: float) -> ReviewFrame:
+    candidate = probe.candidate
     return ReviewFrame(
-        frame=int(candidate.anchor),
-        timestamp_seconds=_seconds(int(candidate.anchor), fps),
+        frame=int(probe.frame),
+        timestamp_seconds=_seconds(int(probe.frame), fps),
         score=float(candidate.fused_score),
         start_frame=int(candidate.start),
         end_frame=int(candidate.end),
@@ -156,78 +231,60 @@ def _candidate_to_review(candidate: Candidate, fps: float) -> ReviewFrame:
             )
         ),
         cluster=int(candidate.cluster),
+        kind=probe.kind,
     )
 
 
-def _far_enough(
-    candidate: Candidate,
-    selected: list[Candidate],
-    *,
-    min_gap_frames: int,
-) -> bool:
-    anchor = int(candidate.anchor)
-    return all(
-        abs(anchor - int(previous.anchor)) >= min_gap_frames
-        for previous in selected
-    )
-
-
-def _review_frames(
+def _candidate_probe_pool(
     candidates: list[Candidate],
     *,
     fps: float,
-    limit: int,
-    min_gap_seconds: float,
-) -> list[Candidate]:
-    """Pick temporal evidence with both channel and time diversity.
+) -> list[_Probe]:
+    """Create evidence points from candidate anchors and broad candidate loci."""
+    pool: list[_Probe] = []
 
-    Order of preference:
-    1. strongest fused candidate;
-    2. strongest candidate from each individual retrieval channel;
-    3. remaining candidates by fused score.
-
-    This matters for human review: a dense-parts peak and an object peak can be
-    more useful than four almost-identical fused peaks.
-    """
-    if limit <= 0 or not candidates:
-        return []
-    if min_gap_seconds < 0:
-        raise ValueError(
-            f"min_gap_seconds must be >= 0, got {min_gap_seconds}"
+    for candidate in candidates:
+        safe_anchor, anchor_kind = _safe_anchor(candidate)
+        best_channel_rank = min(candidate.ranks.values()) if candidate.ranks else 10**9
+        pool.append(
+            _Probe(
+                candidate=candidate,
+                frame=safe_anchor,
+                kind=anchor_kind,
+                priority=(
+                    0,
+                    -float(candidate.fused_score),
+                    best_channel_rank,
+                    safe_anchor,
+                ),
+            )
         )
 
-    min_gap_frames = int(round(min_gap_seconds * fps))
-    ranked = sorted(
-        candidates,
-        key=lambda c: (
-            -float(c.fused_score),
-            min(c.ranks.values()) if c.ranks else 10**9,
-            int(c.anchor),
-        ),
-    )
+        # A broad locus should not be represented by one point.  Probe the
+        # quarter positions.  This is especially useful for temporal candidates
+        # whose locus is correct but whose refined anchor is poor.
+        start = int(candidate.start)
+        end = int(candidate.end)
+        width = end - start
+        if width >= int(round(12.0 * fps)):
+            for q_index, numerator in enumerate((1, 2, 3), 1):
+                frame = start + (width * numerator) // 4
+                pool.append(
+                    _Probe(
+                        candidate=candidate,
+                        frame=frame,
+                        kind=f"locus_q{q_index}",
+                        priority=(
+                            2,
+                            -float(candidate.fused_score),
+                            best_channel_rank,
+                            frame,
+                        ),
+                    )
+                )
 
-    selected: list[Candidate] = []
-    selected_keys: set[tuple[int, int, int]] = set()
-
-    def try_add(candidate: Candidate) -> None:
-        if len(selected) >= limit:
-            return
-        key = (int(candidate.start), int(candidate.end), int(candidate.anchor))
-        if key in selected_keys:
-            return
-        if not _far_enough(
-            candidate,
-            selected,
-            min_gap_frames=min_gap_frames,
-        ):
-            return
-        selected.append(candidate)
-        selected_keys.add(key)
-
-    # 1) Best overall evidence.
-    try_add(ranked[0])
-
-    # 2) Let each channel nominate one distinct temporal peak.
+    # Each retrieval channel gets to promote its best candidate anchor ahead of
+    # generic locus probes.
     channels = sorted(
         {
             channel
@@ -235,7 +292,6 @@ def _review_frames(
             for channel in candidate.ranks
         }
     )
-    channel_nominees: list[tuple[int, float, str, Candidate]] = []
     for channel in channels:
         channel_candidates = [
             candidate
@@ -244,35 +300,74 @@ def _review_frames(
         ]
         if not channel_candidates:
             continue
-        best = min(
+        candidate = min(
             channel_candidates,
             key=lambda c: (
-                c.ranks[channel],
+                int(c.ranks[channel]),
                 -float(c.fused_score),
-                int(c.anchor),
+                int(c.start),
             ),
         )
-        channel_nominees.append(
-            (
-                int(best.ranks[channel]),
-                -float(best.fused_score),
-                channel,
-                best,
+        frame, kind = _safe_anchor(candidate)
+        pool.append(
+            _Probe(
+                candidate=candidate,
+                frame=frame,
+                kind=f"{kind}:{channel}",
+                priority=(
+                    1,
+                    int(candidate.ranks[channel]),
+                    -float(candidate.fused_score),
+                    frame,
+                ),
             )
         )
 
-    for _rank, _neg_score, _channel, candidate in sorted(channel_nominees):
-        try_add(candidate)
-        if len(selected) >= limit:
-            return selected
+    return sorted(pool, key=lambda probe: probe.priority)
 
-    # 3) Fill any remaining slots with the best fused evidence.
-    for candidate in ranked:
-        try_add(candidate)
+
+def _review_frames(
+    candidates: list[Candidate],
+    *,
+    fps: float,
+    limit: int,
+    min_gap_seconds: float,
+) -> list[ReviewFrame]:
+    if limit <= 0 or not candidates:
+        return []
+    if min_gap_seconds < 0:
+        raise ValueError(
+            f"min_gap_seconds must be >= 0, got {min_gap_seconds}"
+        )
+
+    min_gap_frames = int(round(min_gap_seconds * fps))
+    pool = _candidate_probe_pool(candidates, fps=fps)
+
+    selected: list[_Probe] = []
+    seen: set[tuple[int, int, int, str]] = set()
+
+    for probe in pool:
+        key = (
+            int(probe.candidate.start),
+            int(probe.candidate.end),
+            int(probe.frame),
+            probe.kind,
+        )
+        if key in seen:
+            continue
+
+        if any(
+            abs(int(probe.frame) - int(previous.frame)) < min_gap_frames
+            for previous in selected
+        ):
+            continue
+
+        selected.append(probe)
+        seen.add(key)
         if len(selected) >= limit:
             break
 
-    return selected
+    return [_probe_to_review(probe, fps) for probe in selected]
 
 
 def _select_videos(
@@ -281,13 +376,7 @@ def _select_videos(
     top_videos: int,
     max_videos: int,
     rescue_per_channel: int,
-) -> tuple[list[tuple[str, float, int, str]], dict[str, int]]:
-    """Top video ranking plus a small per-channel rescue union.
-
-    The automatic fused ranking can bury a true video even when one individual
-    channel has strong evidence for it.  Human review can cheaply keep a few of
-    those disagreements instead of forcing fusion to choose a single winner.
-    """
+) -> list[tuple[str, float, int, str]]:
     ranked_all = sorted(
         result.video_scores.items(),
         key=lambda item: -float(item[1]),
@@ -302,7 +391,6 @@ def _select_videos(
         selected[video_id] = "global"
 
     if rescue_per_channel > 0 and len(selected) < max_videos:
-        # For every channel, keep its best candidate per video.
         best_by_channel: dict[str, dict[str, Candidate]] = {}
         for candidate in result.candidates:
             for channel, channel_rank in candidate.ranks.items():
@@ -312,18 +400,15 @@ def _select_videos(
                 if current is None:
                     best_by_channel[channel][candidate.video_id] = candidate
                     continue
-                current_rank = current.ranks.get(channel, 10**9)
                 if (
                     int(channel_rank),
                     -float(candidate.fused_score),
                 ) < (
-                    int(current_rank),
+                    int(current.ranks.get(channel, 10**9)),
                     -float(current.fused_score),
                 ):
                     best_by_channel[channel][candidate.video_id] = candidate
 
-        # Round-robin over channels so one noisy channel cannot consume the
-        # entire rescue budget.
         channel_lists: dict[str, list[Candidate]] = {}
         for channel, per_video in best_by_channel.items():
             channel_lists[channel] = sorted(
@@ -336,40 +421,41 @@ def _select_videos(
             )
 
         channels = sorted(channel_lists)
-        used_per_channel = {channel: 0 for channel in channels}
-        cursors = {channel: 0 for channel in channels}
-
+        used = {channel: 0 for channel in channels}
+        cursor = {channel: 0 for channel in channels}
         progressed = True
+
         while len(selected) < max_videos and progressed:
             progressed = False
             for channel in channels:
                 if len(selected) >= max_videos:
                     break
-                if used_per_channel[channel] >= rescue_per_channel:
+                if used[channel] >= rescue_per_channel:
                     continue
 
                 rows = channel_lists[channel]
-                cursor = cursors[channel]
-                while cursor < len(rows) and rows[cursor].video_id in selected:
-                    cursor += 1
-                cursors[channel] = cursor
-                if cursor >= len(rows):
+                i = cursor[channel]
+                while i < len(rows) and rows[i].video_id in selected:
+                    i += 1
+                cursor[channel] = i
+                if i >= len(rows):
                     continue
 
-                candidate = rows[cursor]
-                cursors[channel] += 1
+                candidate = rows[i]
+                cursor[channel] += 1
                 selected[candidate.video_id] = f"channel:{channel}"
-                used_per_channel[channel] += 1
+                used[channel] += 1
                 progressed = True
 
-    rows: list[tuple[str, float, int, str]] = []
-    for video_id, reason in selected.items():
-        score = float(result.video_scores.get(video_id, 0.0))
-        rank = global_rank.get(video_id, len(ranked_all) + 1)
-        rows.append((video_id, score, rank, reason))
-
-    # Keep the normal global top-N first. Rescued videos follow, ordered by
-    # their global rank so the board remains predictable for a human.
+    rows = [
+        (
+            video_id,
+            float(result.video_scores.get(video_id, 0.0)),
+            global_rank.get(video_id, len(ranked_all) + 1),
+            reason,
+        )
+        for video_id, reason in selected.items()
+    ]
     rows.sort(
         key=lambda row: (
             0 if row[3] == "global" else 1,
@@ -377,7 +463,7 @@ def _select_videos(
             row[0],
         )
     )
-    return rows, global_rank
+    return rows
 
 
 def build_review_shortlist(
@@ -395,19 +481,6 @@ def build_review_shortlist(
     min_gap_seconds: float = 8.0,
     default_fps: float = 25.0,
 ) -> ReviewShortlist:
-    """Build a high-recall human review board.
-
-    Default theoretical maximum:
-      ranks 1..10   : 10 * 4 = 40 thumbnails
-      ranks 11..20 : 10 * 2 = 20
-      ranks 21..50 : 30 * 1 = 30
-      channel rescue: up to 10 * 1 = 10
-      ------------------------------------------------
-      total: about 100 thumbnails
-
-    ``top_videos`` is the normal fused-ranking baseline. ``max_videos`` leaves
-    room for videos rescued by individual retrieval channels.
-    """
     if top_videos < 1:
         raise ValueError(f"top_videos must be >= 1, got {top_videos}")
     if max_videos < top_videos:
@@ -427,7 +500,7 @@ def build_review_shortlist(
     for candidate in result.candidates:
         by_video.setdefault(candidate.video_id, []).append(candidate)
 
-    selected_videos, _global_rank = _select_videos(
+    selected_videos = _select_videos(
         result,
         top_videos=top_videos,
         max_videos=max_videos,
@@ -456,15 +529,13 @@ def build_review_shortlist(
         else:
             frame_budget = later_frames
 
-        selected = _review_frames(
-            candidates,
-            fps=fps,
-            limit=frame_budget,
-            min_gap_seconds=min_gap_seconds,
-        )
         frames = tuple(
-            _candidate_to_review(candidate, fps)
-            for candidate in selected
+            _review_frames(
+                candidates,
+                fps=fps,
+                limit=frame_budget,
+                min_gap_seconds=min_gap_seconds,
+            )
         )
         if not frames:
             continue
@@ -491,6 +562,9 @@ def build_review_shortlist(
             f"later/rescued -> {later_frames}; "
             f"minimum temporal gap={min_gap_seconds:g}s"
         ),
+        "display order is video-first round-robin: one frame per video before temporal extras",
+        "anchors outside their own locus are replaced by the locus midpoint only in review",
+        "broad loci (>=12s) contribute quarter-position probes",
         "timestamps are for human review only; submission frame ids are unchanged",
     ]
     if missing_candidates:
