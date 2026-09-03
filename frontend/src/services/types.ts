@@ -36,6 +36,9 @@ export interface SolveAnswerItem {
   }[];
   image_url?: string;
   timestamp?: string;
+  timestamp_seconds?: number;
+  preview_frame_id?: number;
+  preview_keyframe_n?: number;
 }
 
 export interface SolveResponse {
@@ -68,6 +71,14 @@ export interface HealthResponse {
   degraded?: boolean;
   warnings?: string[];
   version?: string;
+  detail?: string;
+  engine?: {
+    ready?: boolean;
+    warnings?: string[];
+    n_videos?: number;
+    n_keyframes?: number;
+    [key: string]: any;
+  };
 }
 
 // 3. DTO cho Bảng History (Lịch sử truy vấn)
@@ -90,6 +101,7 @@ export interface DetectionRecord {
   id: string;
   videoSource: string;
   frameId: string;
+  requestedFrameId?: string;
   timestamp: string;
   confidence: string;
   isAlert?: boolean;

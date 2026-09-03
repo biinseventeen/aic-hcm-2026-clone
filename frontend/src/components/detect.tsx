@@ -1,7 +1,5 @@
-import { useState, useEffect } from "react";
 import "./detect.css";
 import { downloadCSV } from "../utils/exportUtils";
-import { DetectService } from "../services/detectService";
 import { DetectionRecord, DetectTagItem } from "../services/types";
 
 export type DetectTag = DetectTagItem;
@@ -20,20 +18,7 @@ function Detect({
   onExport,
   onSelectItem,
 }: DetectProps) {
-  const [internalItems, setInternalItems] = useState<DetectionRecord[]>([]);
-  const [loadingInternal, setLoadingInternal] = useState(false);
-
-  useEffect(() => {
-    if (items) {
-      setInternalItems(items);
-    } else {
-      setLoadingInternal(true);
-      DetectService.getDetections()
-        .then((data) => setInternalItems(data))
-        .catch(() => setInternalItems([]))
-        .finally(() => setLoadingInternal(false));
-    }
-  }, [items]);
+  const internalItems = items ?? [];
 
   const handleDefaultExport = () => {
     if (onExport) {
@@ -50,7 +35,7 @@ function Detect({
     downloadCSV(`detections_export_${timestampStr}.csv`, rows);
   };
 
-  const displayLoading = isLoading || loadingInternal;
+  const displayLoading = isLoading;
 
   return (
     <aside className="detect-panel" data-component="Detect">

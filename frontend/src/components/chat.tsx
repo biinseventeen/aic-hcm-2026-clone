@@ -445,13 +445,17 @@ function Chat({ mode = "kis", onQueryExecuted }: ChatProps) {
                                 ) : (
                                   <div className="chat-panel__frame-placeholder_01" />
                                 )}
-                                <span className="chat-panel__confidence-badge_01">
-                                  {frame.confidence || "90%"}
-                                </span>
+                                {frame.confidence !== undefined &&
+                                  frame.confidence !== null && (
+                                    <span className="chat-panel__confidence-badge_01">
+                                      {frame.confidence}
+                                    </span>
+                                  )}
                               </div>
                               <div className="chat-panel__frame-footer_01">
                                 <span className="chat-panel__frame-id_01">
-                                  FRM_{frame.frame_id}
+                                  {frame.video_id} / FRM_{frame.frame_id}
+                                  {frame.timestamp ? ` / ${frame.timestamp}` : ""}
                                 </span>
                                 <button
                                   type="button"

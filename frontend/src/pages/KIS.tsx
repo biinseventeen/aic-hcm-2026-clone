@@ -37,11 +37,17 @@ function Kis() {
       ...prev.map((h) => ({ ...h, isActive: false })),
     ]);
 
-    // 2. Cập nhật bảng Detect cho video kết quả đầu tiên
-    const firstVideo = response.answers?.[0]?.video_id || "VID_C_02";
+    // 2. Cập nhật bảng Detect bằng dữ liệu thật của kết quả top-1.
+    const firstAnswer = response.answers?.[0];
+    if (!firstAnswer) {
+      setDetectItems([]);
+      return;
+    }
+
     setIsDetectLoading(true);
-    DetectService.getDetections(firstVideo)
+    DetectService.getDetections(firstAnswer.video_id, firstAnswer.frame_id)
       .then((dets) => setDetectItems(dets))
+      .catch(() => setDetectItems([]))
       .finally(() => setIsDetectLoading(false));
   };
 

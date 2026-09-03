@@ -13,35 +13,40 @@ export class ChatService {
 
     try {
       const allFiles = req.files || (req.file ? [req.file] : []);
+
+      // Backend hiện tại nhận JSON theo contract của aic.api:
+      //   text, task, query_id, ...
+      // Nó KHÔNG nhận multipart/form-data ở /solve.
       if (allFiles.length > 0) {
-        const formData = new FormData();
-        formData.append("query", req.query);
-        formData.append("mode", req.mode);
-        if (req.query_id) formData.append("query_id", req.query_id);
-        if (req.top_k) formData.append("top_k", String(req.top_k));
-
-        allFiles.forEach((f) => {
-          formData.append("files", f);
-        });
-
-        return await ApiClient.post<SolveResponse>("/solve", formData);
+        throw new Error(
+          "FILE_UPLOAD_UNSUPPORTED: Backend /solve currently accepts JSON queries only."
+        );
       }
 
       return await ApiClient.post<SolveResponse>("/solve", {
-        query: req.query,
-        mode: req.mode,
+        text: req.query,
+        task: req.mode,
         query_id: req.query_id || `q_${Date.now()}`,
-        top_k: req.top_k || 100,
         ...req.params,
       });
     } catch (err: any) {
-
-      // Báo lỗi thực tế thay vì sinh kết quả giả mạo
       console.warn("[ChatService]: Query failed:", err);
+
+      const message = String(err?.message || "");
+
+      if (
+        message.includes("Failed to fetch") ||
+        message.includes("NetworkError") ||
+        message.includes("Load failed")
+      ) {
+        throw new Error(
+          "BACKEND_UNREACHABLE: Browser cannot access Backend Engine at http://localhost:8000. " +
+            "If /health is 200 in the server log, check CORS configuration."
+        );
+      }
+
       throw new Error(
-        err?.message?.includes("Failed to fetch") || err?.message?.includes("NetworkError")
-          ? "BACKEND_UNREACHABLE: Cannot connect to Backend Engine at http://localhost:8000. Task halted."
-          : `RETRIEVAL_ERROR: ${err?.message || "Execution stopped due to engine error."}`
+        `RETRIEVAL_ERROR: ${message || "Execution stopped due to engine error."}`
       );
     }
   }
@@ -84,28 +89,28 @@ export class ChatService {
     try {
       const health = await ApiClient.get<HealthResponse>("/health", { timeoutMs: 2500 });
 
-      // 3. Kiểm tra xem đã import video / dense index chưa
-      if (health.warnings && health.warnings.length > 0) {
-        const warningStr = health.warnings.join(" ").toLowerCase();
-        if (
+      // 3. Backend exposes engine warnings under health.engine.warnings.
+      const warnings = health.engine?.warnings ?? health.warnings ?? [];
+      if (health.status === "degraded" || warnings.length > 0) {
+        const warningStr = warnings.join(" ").toLowerCase();
+        const corpusProblem =
           warningStr.includes("index") ||
           warningStr.includes("video") ||
           warningStr.includes("corpus") ||
-          warningStr.includes("dense") ||
-          health.status === "degraded"
-        ) {
+          warningStr.includes("dense");
+
+        if (corpusProblem) {
           return {
             type: "no_video",
             title: "NO_VIDEO_IMPORTED_",
             description:
-              "Video corpus or dense vector index not found in data/batch1. Please import video data before executing retrieval.",
+              "Video corpus or dense vector index is not usable. Check the backend /health details.",
             level: "warning",
-            details: health.warnings.join("; "),
+            details: warnings.join("; "),
           };
         }
       }
 
-      // Nếu backend sẵn sàng và không có cảnh báo nghiêm trọng
       return null;
     } catch (err: any) {
       // Backend không phản hồi
@@ -120,66 +125,5 @@ export class ChatService {
   }
 
 
-  /**
-   * Fallback engine simulator khi chưa kết nối backend
-   */
-  private static generateFallbackResponse(req: SolveRequest): SolveResponse {
-    const timestampStr = new Date().toLocaleTimeString("vi-VN", { hour12: false });
 
-    if (req.mode === "qna") {
-      return {
-        degraded: true,
-        n_answers: 2,
-        allocation: { expected_final: 0.94 },
-        answers: [
-          { rank: 1, video_id: "L26_V469", frame_id: 4492, confidence: "96%", answer: "black metallic suitcase" },
-          { rank: 2, video_id: "L26_V469", frame_id: 4510, confidence: "94%", answer: "black metallic suitcase" },
-        ],
-        qna_answer: {
-          answer_text: `Based on visual analysis of query "${req.query}", the subject placed a black metallic suitcase into the rear cargo compartment.`,
-          confidence: "96%",
-          source_segment: "L26_V469",
-          interval: "14:12:00 - 14:12:30",
-          evidence_frames: [
-            { id: "FRM_4492-A", frame_id: 4492, time: timestampStr, confidence: "96%" },
-            { id: "FRM_4510-B", frame_id: 4510, time: timestampStr, confidence: "94%" },
-          ],
-        },
-      };
-    }
-
-    if (req.mode === "trake") {
-      return {
-        degraded: true,
-        n_answers: 3,
-        allocation: { expected_final: 0.88 },
-        answers: [
-          {
-            rank: 1,
-            video_id: "L26_V469",
-            frame_id: 1012,
-            confidence: "95%",
-            milestones: [
-              { stepId: "01", stepName: "ENTER_ROOM", frameId: 1012, timestamp: "14:20:05", confidence: "95%" },
-              { stepId: "02", stepName: "OPEN_SAFE", frameId: 1140, timestamp: "14:21:40", confidence: "91%" },
-              { stepId: "03", stepName: "HURRY_EXIT", frameId: 1215, timestamp: "14:22:15", confidence: "89%" },
-            ],
-          },
-        ],
-      };
-    }
-
-    // Default KIS mode
-    return {
-      degraded: true,
-      n_answers: 4,
-      allocation: { expected_final: 0.91 },
-      answers: [
-        { rank: 1, video_id: "L26_V469", frame_id: 372, confidence: "92%" },
-        { rank: 2, video_id: "L26_V469", frame_id: 480, confidence: "88%" },
-        { rank: 3, video_id: "L26_V469", frame_id: 496, confidence: "85%" },
-        { rank: 4, video_id: "L26_V469", frame_id: 542, confidence: "94%" },
-      ],
-    };
-  }
 }
