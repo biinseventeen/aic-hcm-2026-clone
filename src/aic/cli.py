@@ -7,6 +7,7 @@ The command order mirrors the mandatory implementation order in DESIGN.md sectio
     build-index       build the dense, shot and text indexes
     devset            blind sampling for the internal evaluation set
     query             run one query, print diagnostics
+    review            human-in-the-loop video/frame shortlist
     run               run a whole query set, produce submission files
     evaluate          score submissions against the internal set
     check-submission  validate submission files before sending
@@ -34,7 +35,7 @@ enable_utf8_stdio()
 
 from .config import Config, load_config  # noqa: E402
 from .log import setup_cli_logging  # noqa: E402
-from .service import Engine, SolveResult  # noqa: E402
+from .service import Engine, ReviewResult, SolveResult  # noqa: E402
 
 #: Diagnostic rows printed per command. Anything longer belongs in the JSON report.
 _MAX_ERRORS_SHOWN = 30
@@ -282,6 +283,36 @@ def cmd_query(args, cfg: Config) -> int:
     return 0
 
 
+def cmd_review(args, cfg: Config) -> int:
+    """Retrieve a human-review shortlist without running the solver/allocator."""
+    engine = Engine.load(cfg, allow_stub=args.allow_stub)
+    print()
+    result: ReviewResult = engine.review(
+        args.text,
+        task_hint=args.task,
+        top_videos=args.top_videos,
+        max_videos=args.max_videos,
+        rescue_per_channel=args.rescue_per_channel,
+        tier1_videos=args.tier1_videos,
+        tier1_frames=args.tier1_frames,
+        tier2_videos=args.tier2_videos,
+        tier2_frames=args.tier2_frames,
+        later_frames=args.later_frames,
+        min_gap_seconds=args.min_gap_seconds,
+    )
+
+    print(result.query.summary())
+    print(
+        f"  candidates: {result.n_candidates}  "
+        f"channels: {result.channel_sizes}"
+    )
+    print(result.report())
+
+    if args.json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_run(args, cfg: Config) -> int:
     from .submit.writer import package_submission
 
@@ -390,6 +421,236 @@ def cmd_serve(args, cfg: Config) -> int:  # noqa: ARG001 — uniform dispatch si
     os.environ.setdefault("AIC_MAX_CONCURRENCY", str(args.concurrency))
     print(f"http://{args.host}:{args.port}/docs  (Ctrl+C to stop)")
     uvicorn.run("aic.api.app:app", host=args.host, port=args.port, reload=args.reload)
+    return 0
+
+
+def cmd_evaluate_review(args, cfg: Config) -> int:
+    """Evaluate the human-review objective, not the competition submission score."""
+    from statistics import median
+
+    from .review import build_review_shortlist
+
+    devset_path = Path(args.devset or Path(cfg.paths.devset_dir) / "devset.json")
+    payload = json.loads(devset_path.read_text(encoding="utf-8"))
+    queries = {
+        query_id: text
+        for query_id, text in payload.get("queries", {}).items()
+        if isinstance(text, str) and text.strip()
+    }
+    truths = payload.get("truths", {})
+    if not queries:
+        print("no labelled queries in the devset")
+        return 1
+
+    engine = Engine.load(cfg, allow_stub=args.allow_stub)
+    rows = []
+    try:
+        for query_id, text in queries.items():
+            truth = truths.get(query_id)
+            if not truth:
+                continue
+
+            query, retrieval = engine.retrieve(
+                text,
+                task_hint=truth.get("task") or None,
+            )
+            shortlist = build_review_shortlist(
+                retrieval,
+                fps_by_video=engine.fps,
+                top_videos=args.top_videos,
+                max_videos=args.max_videos,
+                rescue_per_channel=args.rescue_per_channel,
+                tier1_videos=args.tier1_videos,
+                tier1_frames=args.tier1_frames,
+                tier2_videos=args.tier2_videos,
+                tier2_frames=args.tier2_frames,
+                later_frames=args.later_frames,
+                min_gap_seconds=args.min_gap_seconds,
+                default_fps=cfg.fps_default,
+            )
+
+            truth_video = str(truth.get("video_id") or "")
+            auto_ranked = sorted(
+                retrieval.video_scores.items(),
+                key=lambda item: -float(item[1]),
+            )
+            auto_video_rank = next(
+                (
+                    rank
+                    for rank, (video_id, _score) in enumerate(auto_ranked, 1)
+                    if video_id == truth_video
+                ),
+                None,
+            )
+
+            recall_scores = retrieval.recall_video_scores or retrieval.video_scores
+            recall_ranked = sorted(
+                recall_scores.items(),
+                key=lambda item: -float(item[1]),
+            )
+            video_rank = next(
+                (
+                    rank
+                    for rank, (video_id, _score) in enumerate(recall_ranked, 1)
+                    if video_id == truth_video
+                ),
+                None,
+            )
+
+            shown = False
+            rescued = False
+            first_thumbnail = None
+            frame_hit = False
+            nearest_gap = None
+
+            span_raw = truth.get("span") or []
+            span = None
+            if isinstance(span_raw, list) and len(span_raw) == 2:
+                span = (int(span_raw[0]), int(span_raw[1]))
+
+            for video in shortlist.videos:
+                if video.video_id == truth_video:
+                    shown = True
+                    rescued = video.rescued
+
+            # Measure the actual human viewing order: one thumbnail from every
+            # video first, then second/third/fourth temporal hypotheses.
+            for thumbnail_index, (video, frame) in enumerate(
+                shortlist.scan_order(),
+                1,
+            ):
+                if video.video_id != truth_video:
+                    continue
+                if first_thumbnail is None:
+                    first_thumbnail = thumbnail_index
+                if span is None:
+                    continue
+                if span[0] <= frame.frame <= span[1]:
+                    gap = 0
+                    frame_hit = True
+                elif frame.frame < span[0]:
+                    gap = span[0] - frame.frame
+                else:
+                    gap = frame.frame - span[1]
+                nearest_gap = gap if nearest_gap is None else min(nearest_gap, gap)
+
+            truth_fps = float(engine.fps.get(truth_video, cfg.fps_default))
+            gap_seconds = (
+                (float(nearest_gap) / truth_fps)
+                if nearest_gap is not None and truth_fps > 0
+                else None
+            )
+            row = {
+                "query_id": query_id,
+                "video_rank": video_rank,
+                "auto_video_rank": auto_video_rank,
+                "shown": shown,
+                "rescued": rescued,
+                "first_thumbnail": first_thumbnail,
+                "frame_hit": frame_hit,
+                "nearest_frame_gap": nearest_gap,
+                "nearest_gap_seconds": gap_seconds,
+                "near_5s": gap_seconds is not None and gap_seconds <= 5.0,
+                "near_15s": gap_seconds is not None and gap_seconds <= 15.0,
+                "near_30s": gap_seconds is not None and gap_seconds <= 30.0,
+                "near_60s": gap_seconds is not None and gap_seconds <= 60.0,
+                "n_thumbnails": shortlist.n_frames,
+            }
+            rows.append(row)
+            gap_s_text = "None" if gap_seconds is None else f"{gap_seconds:.1f}s"
+            print(
+                f"{query_id:<10} "
+                f"recall_rank={str(video_rank):<4} "
+                f"auto_rank={str(auto_video_rank):<4} "
+                f"shown={str(shown):<5} "
+                f"rescued={str(rescued):<5} "
+                f"thumb={str(first_thumbnail):<4} "
+                f"frame_hit={str(frame_hit):<5} "
+                f"gap={str(nearest_gap):<5} ({gap_s_text})"
+            )
+    finally:
+        engine.close()
+
+    if not rows:
+        print("no query had ground truth")
+        return 1
+
+    def recall_at(k: int) -> float:
+        return sum(
+            row["video_rank"] is not None and row["video_rank"] <= k
+            for row in rows
+        ) / len(rows)
+
+    shown_count = sum(bool(row["shown"]) for row in rows)
+    frame_hit_count = sum(bool(row["frame_hit"]) for row in rows)
+    thumbnails = [
+        int(row["first_thumbnail"])
+        for row in rows
+        if row["first_thumbnail"] is not None
+    ]
+    shown_gaps = [
+        float(row["nearest_gap_seconds"])
+        for row in rows
+        if row["shown"] and row["nearest_gap_seconds"] is not None
+    ]
+
+    print("\n=== HUMAN REVIEW EVALUATION ===")
+    for k in (5, 10, 20, 50, 100):
+        print(f"Recall-pool Video R@{k:<3}: {recall_at(k):.3f}")
+    print(
+        f"truth video shown       : {shown_count}/{len(rows)} "
+        f"({shown_count / len(rows):.1%})"
+    )
+    print(
+        f"selected frame inside GT: {frame_hit_count}/{len(rows)} "
+        f"({frame_hit_count / len(rows):.1%})"
+    )
+    for seconds, key in ((5, "near_5s"), (15, "near_15s"), (30, "near_30s"), (60, "near_60s")):
+        count = sum(bool(row[key]) for row in rows)
+        print(
+            f"temporal cue <= {seconds:>2}s    : {count}/{len(rows)} "
+            f"({count / len(rows):.1%})"
+        )
+    print(
+        "median nearest gap (shown): "
+        + (f"{median(shown_gaps):.1f}s" if shown_gaps else "n/a")
+    )
+    print(
+        "median thumbnails to truth: "
+        + (f"{median(thumbnails):g}" if thumbnails else "n/a")
+    )
+
+    out = Path(cfg.paths.report_dir) / "evaluate_review.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(
+            {
+                "n": len(rows),
+                "video_recall": {
+                    str(k): recall_at(k) for k in (5, 10, 20, 50, 100)
+                },
+                "truth_video_shown": shown_count,
+                "frame_hits": frame_hit_count,
+                "temporal_cue_within_seconds": {
+                    "5": sum(bool(row["near_5s"]) for row in rows),
+                    "15": sum(bool(row["near_15s"]) for row in rows),
+                    "30": sum(bool(row["near_30s"]) for row in rows),
+                    "60": sum(bool(row["near_60s"]) for row in rows),
+                },
+                "median_nearest_gap_seconds_shown": (
+                    median(shown_gaps) if shown_gaps else None
+                ),
+                "median_thumbnails_to_truth": (
+                    median(thumbnails) if thumbnails else None
+                ),
+                "per_query": rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"report: {out}")
     return 0
 
 
@@ -625,6 +886,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     query.add_argument("--no-hedge-answers", action="store_true", help=_HEDGE_HELP)
 
+    review = subparsers.add_parser(
+        "review",
+        help="human-in-the-loop shortlist from retrieval; does not run P10/P13",
+    )
+    review.add_argument("text")
+    review.add_argument("--task", choices=["kis", "qa", "trake"], default=None)
+    review.add_argument(
+        "--top-videos",
+        type=int,
+        default=50,
+        help="normal fused-ranking videos kept before channel rescue",
+    )
+    review.add_argument(
+        "--max-videos",
+        type=int,
+        default=60,
+        help="maximum videos after adding per-channel rescue hypotheses",
+    )
+    review.add_argument(
+        "--rescue-per-channel",
+        type=int,
+        default=2,
+        help="extra video hypotheses each retrieval channel may nominate",
+    )
+    review.add_argument("--tier1-videos", type=int, default=10)
+    review.add_argument("--tier1-frames", type=int, default=4)
+    review.add_argument("--tier2-videos", type=int, default=20)
+    review.add_argument("--tier2-frames", type=int, default=3)
+    review.add_argument(
+        "--later-frames",
+        type=int,
+        default=2,
+        help="frames for rank > tier2 and channel-rescued videos",
+    )
+    review.add_argument(
+        "--min-gap-seconds",
+        type=float,
+        default=8.0,
+        help="minimum time gap between shown frames from the same video",
+    )
+    review.add_argument(
+        "--json",
+        action="store_true",
+        help="also print the review result as JSON",
+    )
+    review.add_argument(
+        "--allow-stub",
+        action="store_true",
+        help="allow the stub encoder (pipeline testing only)",
+    )
+
     run = subparsers.add_parser("run", help="run a whole query set and write submissions")
     run.add_argument("queries", help="JSON {query_id: text}")
     run.add_argument(
@@ -659,6 +971,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="allow writing submissions from the stub encoder (NEVER for a real submission)",
     )
     run.add_argument("--no-hedge-answers", action="store_true", help=_HEDGE_HELP)
+
+    evaluate_review = subparsers.add_parser(
+        "evaluate-review",
+        help="measure video/thumbnail recall for the human-review pipeline",
+    )
+    evaluate_review.add_argument("--devset", default=None)
+    evaluate_review.add_argument("--top-videos", type=int, default=50)
+    evaluate_review.add_argument("--max-videos", type=int, default=60)
+    evaluate_review.add_argument("--rescue-per-channel", type=int, default=2)
+    evaluate_review.add_argument("--tier1-videos", type=int, default=10)
+    evaluate_review.add_argument("--tier1-frames", type=int, default=4)
+    evaluate_review.add_argument("--tier2-videos", type=int, default=20)
+    evaluate_review.add_argument("--tier2-frames", type=int, default=3)
+    evaluate_review.add_argument("--later-frames", type=int, default=2)
+    evaluate_review.add_argument("--min-gap-seconds", type=float, default=8.0)
+    evaluate_review.add_argument("--allow-stub", action="store_true")
 
     evaluate = subparsers.add_parser("evaluate", help="score against the internal eval set")
     evaluate.add_argument("--devset", default=None)
@@ -702,6 +1030,8 @@ _COMMANDS = {
     "build-index": cmd_build_index,
     "devset": cmd_devset,
     "query": cmd_query,
+    "review": cmd_review,
+    "evaluate-review": cmd_evaluate_review,
     "run": cmd_run,
     "evaluate": cmd_evaluate,
     "check-submission": cmd_check_submission,

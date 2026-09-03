@@ -40,7 +40,7 @@ from typing import Any, Literal
 from .config import Config, load_config
 from .log import log
 
-__all__ = ["Engine", "EngineStatus", "SolveResult", "TaskName"]
+__all__ = ["Engine", "EngineStatus", "ReviewResult", "SolveResult", "TaskName"]
 
 TaskName = Literal["kis", "qa", "trake"]
 
@@ -146,6 +146,47 @@ class SolveResult:
             },
             "answers": answers,
             "notes": [*self.trace.notes, *self.notes],
+        }
+
+
+@dataclass
+class ReviewResult:
+    """Human-in-the-loop retrieval result.
+
+    This is deliberately separate from :class:`SolveResult`: it never runs the
+    task solver, P10 spread, P13 allocator, or submission writer.  It exposes a
+    compact review board over the same retrieval result used by ``solve``.
+    """
+
+    query: Any
+    shortlist: Any  # aic.review.shortlist.ReviewShortlist
+    n_candidates: int = 0
+    channel_sizes: dict[str, int] = field(default_factory=dict)
+    elapsed_s: float = 0.0
+    degraded: bool = False
+
+    def report(self) -> str:
+        return self.shortlist.report()
+
+    def to_dict(self) -> dict:
+        return {
+            "task": self.query.task,
+            "degraded": self.degraded,
+            "elapsed_s": round(self.elapsed_s, 3),
+            "query": {
+                "raw": self.query.raw,
+                "task_confidence": round(float(self.query.task_confidence), 3),
+                "parser": self.query.parser,
+                "keywords": list(self.query.keywords),
+                "entities": list(self.query.entities),
+                "moments": list(self.query.moments),
+                "domain_hints": list(self.query.domain_hints),
+            },
+            "retrieval": {
+                "n_candidates": self.n_candidates,
+                "channel_sizes": dict(self.channel_sizes),
+            },
+            "review": self.shortlist.to_dict(),
         }
 
 
@@ -385,6 +426,80 @@ class Engine:
             query.english = english
         return query
 
+    def retrieve(
+        self,
+        text: str,
+        *,
+        task_hint: TaskName | None = None,
+        english: str = "",
+    ):
+        """Run the shared parse + retrieval core used by both solve and review.
+
+        No task solver, coverage spread, allocator, or submission logic runs
+        here.  Keeping this as one method guarantees ``aic query`` and
+        ``aic review`` start from the same retrieval candidates.
+        """
+        query = self.parse(text, task_hint=task_hint, english=english)
+        retrieval = self.retriever.retrieve(query)
+        retrieval.candidates = self.retriever.cluster_near_duplicates(
+            retrieval.candidates
+        )
+        return query, retrieval
+
+    def review(
+        self,
+        text: str,
+        *,
+        task_hint: TaskName | None = None,
+        english: str = "",
+        top_videos: int = 50,
+        max_videos: int = 60,
+        rescue_per_channel: int = 2,
+        tier1_videos: int = 10,
+        tier1_frames: int = 4,
+        tier2_videos: int = 20,
+        tier2_frames: int = 3,
+        later_frames: int = 2,
+        min_gap_seconds: float = 8.0,
+    ) -> ReviewResult:
+        """Build a human-review shortlist from the shared retrieval core.
+
+        This path is intentionally independent from :meth:`solve`: it does not
+        invoke P10/P13 and cannot alter the normal submission-producing path.
+        """
+        from .review import build_review_shortlist
+
+        started = time.perf_counter()
+        query, retrieval = self.retrieve(
+            text,
+            task_hint=task_hint,
+            english=english,
+        )
+        shortlist = build_review_shortlist(
+            retrieval,
+            fps_by_video=self.fps,
+            top_videos=top_videos,
+            max_videos=max_videos,
+            rescue_per_channel=rescue_per_channel,
+            tier1_videos=tier1_videos,
+            tier1_frames=tier1_frames,
+            tier2_videos=tier2_videos,
+            tier2_frames=tier2_frames,
+            later_frames=later_frames,
+            min_gap_seconds=min_gap_seconds,
+            default_fps=self.cfg.fps_default,
+        )
+        return ReviewResult(
+            query=query,
+            shortlist=shortlist,
+            n_candidates=len(retrieval.candidates),
+            channel_sizes=dict(
+                getattr(retrieval, "channel_sizes", {}) or {}
+            ),
+            elapsed_s=time.perf_counter() - started,
+            degraded=self.encoder is None or self.encoder_is_stub,
+        )
+
     def solve(
         self,
         text: str,
@@ -418,9 +533,11 @@ class Engine:
         from .tasks.trake import solve_trake, windows_from_keyframes
 
         started = time.perf_counter()
-        query = self.parse(text, task_hint=task_hint, english=english)
-        retrieval = self.retriever.retrieve(query)
-        retrieval.candidates = self.retriever.cluster_near_duplicates(retrieval.candidates)
+        query, retrieval = self.retrieve(
+            text,
+            task_hint=task_hint,
+            english=english,
+        )
 
         answer_len = self.cfg.answer_span.for_task(query.task)
         pad_seconds = self.cfg.retrieval.locus_pad_seconds

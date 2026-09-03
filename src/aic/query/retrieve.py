@@ -79,13 +79,34 @@ class Candidate:
 @dataclass
 class RetrievalResult:
     candidates: list[Candidate] = field(default_factory=list)
-    #: normalised video-level scores — this is the uncalibrated pi_v.
+    #: Automatic-solver video scores derived from the final capped candidate set.
+    #: Kept unchanged so ``aic query`` preserves its existing behaviour.
     video_scores: dict[str, float] = field(default_factory=dict)
+
+    #: High-recall video ranking computed BEFORE final shot-level truncation.
+    #: Human review uses this field because a video should not disappear merely
+    #: because none of its shots survived the top-N final fused candidate list.
+    recall_video_scores: dict[str, float] = field(default_factory=dict)
+
+    #: One cheap representative shot for videos in the recall pool.  These are
+    #: review evidence only and are never fed to the automatic allocator.
+    recall_candidates: list[Candidate] = field(default_factory=list)
+
+    #: Per-channel video ranks before fusion, useful for diagnosing true
+    #: retrieval misses versus fusion/truncation misses.
+    channel_video_ranks: dict[str, dict[str, int]] = field(default_factory=dict)
+
     channel_sizes: dict[str, int] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     def top_videos(self, n: int = 10) -> list[tuple[str, float]]:
+        """Automatic-solver ranking (legacy behaviour)."""
         return sorted(self.video_scores.items(), key=lambda kv: -kv[1])[:n]
+
+    def top_recall_videos(self, n: int = 10) -> list[tuple[str, float]]:
+        """Pre-truncation ranking intended for human review."""
+        scores = self.recall_video_scores or self.video_scores
+        return sorted(scores.items(), key=lambda kv: -kv[1])[:n]
 
     def diagnostics(self) -> str:
         distinct_videos = len({c.video_id for c in self.candidates})
@@ -101,9 +122,17 @@ class RetrievalResult:
         agreed = sum(1 for c in self.candidates if c.n_channels >= 2)
         lines.append(f"candidates with >=2 channels agreeing: {agreed}/{len(self.candidates)}")
         lines.append(
-            "top videos: "
+            "top videos (auto): "
             + ", ".join(f"{video}={score:.3f}" for video, score in self.top_videos(8))
         )
+        if self.recall_video_scores:
+            lines.append(
+                "top videos (recall): "
+                + ", ".join(
+                    f"{video}={score:.3f}"
+                    for video, score in self.top_recall_videos(8)
+                )
+            )
         lines.extend(f"  [i] {note}" for note in self.notes)
         return "\n".join(lines)
 
@@ -1010,9 +1039,14 @@ class Retriever:
         )
         for channel in channels:
             channel.weight = channel_weights.get(
-            channel.name,
-            1.0,
-        )
+                channel.name,
+                1.0,
+            )
+
+        # Freeze the whole-corpus channels.  The local temporal/localised
+        # channels added later only search a conditioned subset of videos, so
+        # they must not define the recall ceiling for human review.
+        base_channels = list(channels)
 
     # ----------------------------------------------------------
     # VIDEO-CONDITIONED SHOT LOCALISATION
@@ -1049,6 +1083,85 @@ class Retriever:
             eta=self.rrf_eta,
             depth=self.channel_depth,
         )
+
+        # ------------------------------------------------------------------
+        # PRE-TRUNCATION VIDEO RECALL POOL
+        #
+        # ``video_scores`` used by the automatic solver is currently computed
+        # from the final top-500 shot list.  That is correct for allocation but
+        # too lossy for human review: a video can have evidence in one or more
+        # whole-corpus channels and still disappear because all of its shots
+        # fall below the final shot-level cut.
+        #
+        # Preserve the full video-level RRF ranking separately.  No automatic
+        # score or candidate is changed by this.
+        # ------------------------------------------------------------------
+        channel_video_ranks: dict[str, dict[str, int]] = {
+            channel.name: {
+                str(video_id): rank
+                for rank, video_id in enumerate(channel.ranked, 1)
+            }
+            for channel in video_channels
+        }
+
+        recall_raw = {
+            str(item.item): float(item.score)
+            for item in video_fused
+        }
+        recall_total = sum(recall_raw.values())
+        recall_video_scores = (
+            {
+                video_id: score / recall_total
+                for video_id, score in recall_raw.items()
+            }
+            if recall_total > 0
+            else recall_raw
+        )
+
+        # One representative base-channel shot for each high-recall video.
+        # The reserve is intentionally separate from ``result.candidates`` so
+        # P10/P13 and ``aic query`` cannot be affected.
+        RECALL_POOL_VIDEOS = 300
+        recall_video_ids = {
+            str(item.item)
+            for item in video_fused[:RECALL_POOL_VIDEOS]
+        }
+        base_fused = reciprocal_rank_fusion(
+            base_channels,
+            eta=self.rrf_eta,
+            depth=self.channel_depth,
+        )
+        recall_candidates: list[Candidate] = []
+        recall_seen: set[str] = set()
+
+        for item in base_fused:
+            video_id, shot_id = item.item  # type: ignore[misc]
+            video_id = str(video_id)
+            if video_id not in recall_video_ids or video_id in recall_seen:
+                continue
+
+            shot = next(
+                (s for s in self.shots.of(video_id) if s.shot_id == shot_id),
+                None,
+            )
+            if shot is None:
+                continue
+
+            recall_seen.add(video_id)
+            recall_candidates.append(
+                Candidate(
+                    video_id=video_id,
+                    start=int(shot.start),
+                    end=int(shot.end),
+                    anchor=(int(shot.start) + int(shot.end)) // 2,
+                    fused_score=float(item.score),
+                    ranks=dict(item.ranks),
+                    raw=dict(item.raw),
+                    shot_id=int(shot.shot_id),
+                )
+            )
+            if len(recall_seen) >= len(recall_video_ids):
+                break
 
         # 100 is deliberate: our diagnostics showed some correct videos
         # around video rank 38, 44, 59 and 97.
@@ -1107,7 +1220,10 @@ class Retriever:
         
 
         result = RetrievalResult(
-            channel_sizes={channel.name: len(channel.ranked) for channel in channels}
+            recall_video_scores=recall_video_scores,
+            recall_candidates=recall_candidates,
+            channel_video_ranks=channel_video_ranks,
+            channel_sizes={channel.name: len(channel.ranked) for channel in channels},
         )
         if not fused:
             result.notes.append(
@@ -1155,6 +1271,13 @@ class Retriever:
             )
 
         result.video_scores = self._video_scores(result.candidates, query)
+        auto_videos = set(result.video_scores)
+        recall_only = set(result.recall_video_scores) - auto_videos
+        if recall_only:
+            result.notes.append(
+                f"{len(recall_only)} videos retained in the pre-truncation recall pool "
+                "but absent from the automatic final candidate ranking"
+            )
         return result
 
     def _video_scores(self, candidates: list[Candidate], query: ParsedQuery) -> dict[str, float]:
