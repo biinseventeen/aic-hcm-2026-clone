@@ -6,7 +6,7 @@ import Detect from "../components/detect";
 import { HistoryService } from "../services/historyService";
 import { DetectService } from "../services/detectService";
 import { HistoryRecord, DetectionRecord, SolveResponse } from "../services/types";
-import "./KIS.css";
+import "../styles/KIS.css";
 
 function Trake() {
   const [historyItems, setHistoryItems] = useState<HistoryRecord[]>([]);

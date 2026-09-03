@@ -470,14 +470,28 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
             )
 
             truth_video = str(truth.get("video_id") or "")
-            ranked_all = sorted(
+            auto_ranked = sorted(
                 retrieval.video_scores.items(),
+                key=lambda item: -float(item[1]),
+            )
+            auto_video_rank = next(
+                (
+                    rank
+                    for rank, (video_id, _score) in enumerate(auto_ranked, 1)
+                    if video_id == truth_video
+                ),
+                None,
+            )
+
+            recall_scores = retrieval.recall_video_scores or retrieval.video_scores
+            recall_ranked = sorted(
+                recall_scores.items(),
                 key=lambda item: -float(item[1]),
             )
             video_rank = next(
                 (
                     rank
-                    for rank, (video_id, _score) in enumerate(ranked_all, 1)
+                    for rank, (video_id, _score) in enumerate(recall_ranked, 1)
                     if video_id == truth_video
                 ),
                 None,
@@ -529,6 +543,7 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
             row = {
                 "query_id": query_id,
                 "video_rank": video_rank,
+                "auto_video_rank": auto_video_rank,
                 "shown": shown,
                 "rescued": rescued,
                 "first_thumbnail": first_thumbnail,
@@ -545,7 +560,8 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
             gap_s_text = "None" if gap_seconds is None else f"{gap_seconds:.1f}s"
             print(
                 f"{query_id:<10} "
-                f"video_rank={str(video_rank):<4} "
+                f"recall_rank={str(video_rank):<4} "
+                f"auto_rank={str(auto_video_rank):<4} "
                 f"shown={str(shown):<5} "
                 f"rescued={str(rescued):<5} "
                 f"thumb={str(first_thumbnail):<4} "
@@ -580,7 +596,7 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
 
     print("\n=== HUMAN REVIEW EVALUATION ===")
     for k in (5, 10, 20, 50, 100):
-        print(f"Video R@{k:<3}: {recall_at(k):.3f}")
+        print(f"Recall-pool Video R@{k:<3}: {recall_at(k):.3f}")
     print(
         f"truth video shown       : {shown_count}/{len(rows)} "
         f"({shown_count / len(rows):.1%})"

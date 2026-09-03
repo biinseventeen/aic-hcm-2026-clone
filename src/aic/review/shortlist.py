@@ -469,8 +469,9 @@ def _select_videos(
     max_videos: int,
     rescue_per_channel: int,
 ) -> list[tuple[str, float, int, str]]:
+    review_scores = result.recall_video_scores or result.video_scores
     ranked_all = sorted(
-        result.video_scores.items(),
+        review_scores.items(),
         key=lambda item: -float(item[1]),
     )
     global_rank = {
@@ -484,7 +485,8 @@ def _select_videos(
 
     if rescue_per_channel > 0 and len(selected) < max_videos:
         best_by_channel: dict[str, dict[str, Candidate]] = {}
-        for candidate in result.candidates:
+        review_candidates = [*result.candidates, *result.recall_candidates]
+        for candidate in review_candidates:
             for channel, channel_rank in candidate.ranks.items():
                 current = best_by_channel.setdefault(channel, {}).get(
                     candidate.video_id
@@ -542,7 +544,7 @@ def _select_videos(
     rows = [
         (
             video_id,
-            float(result.video_scores.get(video_id, 0.0)),
+            float(review_scores.get(video_id, 0.0)),
             global_rank.get(video_id, len(ranked_all) + 1),
             reason,
         )
@@ -589,7 +591,15 @@ def build_review_shortlist(
         raise ValueError(f"default_fps must be > 0, got {default_fps}")
 
     by_video: dict[str, list[Candidate]] = {}
-    for candidate in result.candidates:
+    seen_candidate_keys: set[tuple[str, int, int]] = set()
+
+    # Automatic candidates first: they carry temporal/localised evidence and
+    # should win when the recall reserve points at the same shot.
+    for candidate in [*result.candidates, *result.recall_candidates]:
+        key = (candidate.video_id, int(candidate.shot_id), int(candidate.anchor))
+        if key in seen_candidate_keys:
+            continue
+        seen_candidate_keys.add(key)
         by_video.setdefault(candidate.video_id, []).append(candidate)
 
     selected_videos = _select_videos(
@@ -654,6 +664,7 @@ def build_review_shortlist(
             f"later/rescued -> {later_frames}; "
             f"minimum temporal gap={min_gap_seconds:g}s"
         ),
+        "global video ranking uses the pre-truncation core recall pool when available",
         "display order is video-first round-robin: one frame per video before temporal extras",
         "raw retrieval anchors are preserved; temporal/locus alternatives are shown separately",
         "broad loci (>=12s) contribute quarter-position probes",
