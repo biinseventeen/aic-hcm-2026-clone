@@ -1,0 +1,115 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap');
+
+:root {
+    font-family: 'Space Mono', monospace;
+    color: #080808;
+    background: #f7f7f5;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    min-width: 320px;
+    background: #f7f7f5;
+}
+
+button,
+a {
+    font: inherit;
+}
+
+.site-header {
+    display: flex;
+    align-items: center;
+    min-height: 48px;
+    margin: 0 18px;
+    padding: 0 9px;
+    border-bottom: 3px solid #080808;
+    border-right: 3px solid #080808;
+    gap: 42px;
+}
+
+.site-header__logo {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 27px;
+    flex: 0 0 auto;
+    color: #fff;
+    background: #080808;
+    font-size: 16px;
+    font-weight: 700;
+    line-height: 1;
+    text-decoration: none;
+}
+
+.site-header__nav {
+    display: flex;
+    align-items: center;
+    gap: 42px;
+}
+
+.site-header__menu,
+.site-header__new-search {
+    text-decoration: none;
+    padding: 3px 0;
+    border: 0;
+    color: #080808;
+    background: transparent;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.site-header__menu:hover,
+.site-header__new-search:hover {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+
+.site-header__chevron {
+    display: inline-block;
+    width: 0;
+    height: 0;
+    margin-left: 5px;
+    vertical-align: middle;
+    border-top: 4px solid #080808;
+    border-right: 3px solid transparent;
+    border-left: 3px solid transparent;
+}
+
+.site-header__new-search {
+    margin-left: auto;
+}
+
+.site-header__new-search span {
+    margin-right: 4px;
+    font-size: 15px;
+    font-weight: 400;
+    vertical-align: -1px;
+}
+
+@media (max-width: 760px) {
+    .site-header {
+        flex-wrap: wrap;
+        gap: 18px;
+        padding: 10px 9px;
+    }
+
+    .site-header__nav {
+        order: 3;
+        width: 100%;
+        justify-content: space-between;
+        gap: 12px;
+    }
+
+    .site-header__new-search {
+        margin-left: auto;
+    }
+}
