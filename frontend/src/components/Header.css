@@ -25,11 +25,10 @@ a {
     display: flex;
     align-items: center;
     min-height: 48px;
-    margin: 0 18px;
-    padding: 0 9px;
-    border-bottom: 3px solid #080808;
-    border-right: 3px solid #080808;
-    gap: 42px;
+    margin: 0;
+    padding: 0 16px;
+    border-bottom: 2px solid #080808;
+    gap: 32px;
 }
 
 .site-header__logo {
@@ -71,6 +70,17 @@ a {
 .site-header__new-search:hover {
     text-decoration: underline;
     text-underline-offset: 3px;
+}
+
+.site-header__menu--active {
+    background: #080808;
+    color: #ffffff !important;
+    padding: 6px 10px;
+    text-decoration: none !important;
+}
+
+.site-header__menu--active .site-header__chevron {
+    border-top-color: #ffffff;
 }
 
 .site-header__chevron {

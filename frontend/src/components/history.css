@@ -1,0 +1,148 @@
+.history-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 0;
+  width: 100%;
+  max-width: 280px;
+  background-color: transparent;
+  box-sizing: border-box;
+}
+
+.history-panel__header_01 {
+  display: flex;
+  align-items: center;
+  background: #000000;
+  padding: 16px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.history-panel__title_01 {
+  margin: 0;
+  color: #ffffff;
+  font-family: "SpaceMono-Bold", "Space Mono", monospace;
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 1.2px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.history-panel__list_01 {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+}
+
+.history-panel__item_01 {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  font-family: inherit;
+  transition: background-color 0.15s ease;
+  box-sizing: border-box;
+}
+
+.history-panel__item_01:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+.history-panel__time_01 {
+  color: #1b1b1b;
+  font-family: "SpaceMono-Bold", "Space Mono", monospace;
+  font-size: 12px;
+  line-height: 1.2;
+  letter-spacing: 0.6px;
+  font-weight: 700;
+  opacity: 0.7;
+}
+
+.history-panel__query_01 {
+  color: #1b1b1b;
+  font-family: "SpaceMono-Regular", "Space Mono", monospace;
+  font-size: 14px;
+  line-height: 1.4;
+  font-weight: 400;
+  word-break: break-word;
+}
+
+.history-panel__hits_01 {
+  color: #5e5f5b;
+  font-family: "SpaceMono-Regular", "Space Mono", monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  font-weight: 400;
+  margin-top: 2px;
+}
+
+/* Active State (mục được chọn) */
+.history-panel__item_01--active {
+  background: #000000;
+}
+
+.history-panel__item_01--active:hover {
+  background: #1a1a1a;
+}
+
+.history-panel__item_01--active .history-panel__time_01 {
+  color: #ffffff;
+  opacity: 1;
+}
+
+.history-panel__item_01--active .history-panel__query_01 {
+  color: #ffffff;
+}
+
+.history-panel__item_01--active .history-panel__hits_01 {
+  color: #dadada;
+}
+
+/* Empty & Loading States */
+.history-panel__empty_01,
+.history-panel__loading_01 {
+  padding: 24px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+}
+
+.history-panel__empty-title_01 {
+  font-family: "SpaceMono-Bold", "Space Mono", monospace;
+  font-size: 11px;
+  color: #888888;
+  letter-spacing: 0.6px;
+}
+
+.history-panel__empty-desc_01 {
+  margin: 0;
+  font-family: "SpaceMono-Regular", "Space Mono", monospace;
+  font-size: 11px;
+  color: #a3a3a3;
+  line-height: 1.4;
+}
+
+.history-panel__pulse_01 {
+  font-family: "SpaceMono-Bold", "Space Mono", monospace;
+  font-size: 11px;
+  color: #1b1b1b;
+  letter-spacing: 0.8px;
+  animation: pulse-opacity 1.5s infinite ease-in-out;
+}
+
+@keyframes pulse-opacity {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+
