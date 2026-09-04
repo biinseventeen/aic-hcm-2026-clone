@@ -34,10 +34,17 @@ function Qa() {
       ...prev.map((h) => ({ ...h, isActive: false })),
     ]);
 
-    const firstVideo = response.answers?.[0]?.video_id || "VID_C_02";
+    const firstAnswer = response.answers?.[0];
+    const frameId = firstAnswer?.frame_id ?? firstAnswer?.frame_ids?.[0];
+    if (!firstAnswer?.video_id || frameId === undefined) {
+      setDetectItems([]);
+      return;
+    }
+
     setIsDetectLoading(true);
-    DetectService.getDetections(firstVideo)
+    DetectService.getDetections(firstAnswer.video_id, frameId)
       .then((dets) => setDetectItems(dets))
+      .catch(() => setDetectItems([]))
       .finally(() => setIsDetectLoading(false));
   };
 

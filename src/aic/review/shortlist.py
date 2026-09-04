@@ -23,8 +23,8 @@ from ..query.retrieve import Candidate, RetrievalResult
 
 __all__ = [
     "ReviewFrame",
-    "ReviewVideo",
     "ReviewShortlist",
+    "ReviewVideo",
     "build_review_shortlist",
 ]
 
@@ -221,7 +221,7 @@ def _is_temporal_channel(channel: str) -> bool:
 
 
 def _broad_locus(candidate: Candidate, fps: float) -> bool:
-    return int(candidate.end) - int(candidate.start) >= int(round(12.0 * fps))
+    return int(candidate.end) - int(candidate.start) >= round(12.0 * fps)
 
 
 def _probe_to_review(probe: _Probe, fps: float) -> ReviewFrame:
@@ -413,7 +413,7 @@ def _review_frames(
             f"min_gap_seconds must be >= 0, got {min_gap_seconds}"
         )
 
-    min_gap_frames = int(round(min_gap_seconds * fps))
+    min_gap_frames = round(min_gap_seconds * fps)
     families = _candidate_probe_pool(candidates, fps=fps)
 
     selected: list[_Probe] = []
@@ -515,8 +515,8 @@ def _select_videos(
             )
 
         channels = sorted(channel_lists)
-        used = {channel: 0 for channel in channels}
-        cursor = {channel: 0 for channel in channels}
+        used = dict.fromkeys(channels, 0)
+        cursor = dict.fromkeys(channels, 0)
         progressed = True
 
         while len(selected) < max_videos and progressed:

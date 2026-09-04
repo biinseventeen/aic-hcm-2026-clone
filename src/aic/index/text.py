@@ -46,8 +46,8 @@ __all__ = [
     "TextIndex",
     "char_ngrams",
     "docs_from_media_info",
+    "docs_from_objects",
     "docs_from_titles",
-    "docs_from_objects"
     "normalize_vi",
     "strip_diacritics",
     "tokenize_vi",

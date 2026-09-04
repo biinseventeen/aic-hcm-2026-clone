@@ -10,6 +10,33 @@ interface RequestOptions {
   headers?: Record<string, string>;
 }
 
+async function httpErrorMessage(response: Response): Promise<string> {
+  const fallback = `HTTP ${response.status}: ${response.statusText}`;
+  try {
+    const payload = await response.json();
+    const detail = payload?.detail;
+    if (typeof detail === "string" && detail.trim()) {
+      return `${fallback} — ${detail}`;
+    }
+    if (detail && typeof detail === "object") {
+      const error = detail.error || payload.error;
+      const extra = detail.detail;
+      if (error && extra) {
+        return `${fallback} — ${error}: ${extra}`;
+      }
+      if (error) {
+        return `${fallback} — ${error}`;
+      }
+    }
+    if (typeof payload?.error === "string") {
+      return `${fallback} — ${payload.error}`;
+    }
+  } catch {
+    // body is not JSON; keep the status line
+  }
+  return fallback;
+}
+
 export class ApiClient {
   private static baseUrl = API_BASE_URL;
 
@@ -42,7 +69,7 @@ export class ApiClient {
       clearTimeout(timeout);
 
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        throw new Error(await httpErrorMessage(response));
       }
 
       return await response.json();
@@ -81,7 +108,7 @@ export class ApiClient {
       clearTimeout(timeout);
 
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        throw new Error(await httpErrorMessage(response));
       }
 
       return await response.json();

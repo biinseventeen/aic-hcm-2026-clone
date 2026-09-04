@@ -307,10 +307,10 @@ class Engine:
         title_path = Path(cfg.paths.index_dir) / "text_title.json"
         if title_path.exists():
             title = TextIndex.load(title_path, with_fuzzy=False)
-        
+
         objects = None
         objects_path = Path(cfg.paths.index_dir) / "text_objects.json"
-        
+
         if objects_path.exists():
             objects = TextIndex.load(
                 objects_path,

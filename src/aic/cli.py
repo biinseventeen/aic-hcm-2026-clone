@@ -450,7 +450,7 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
             if not truth:
                 continue
 
-            query, retrieval = engine.retrieve(
+            _query, retrieval = engine.retrieve(
                 text,
                 task_hint=truth.get("task") or None,
             )
@@ -560,13 +560,13 @@ def cmd_evaluate_review(args, cfg: Config) -> int:
             gap_s_text = "None" if gap_seconds is None else f"{gap_seconds:.1f}s"
             print(
                 f"{query_id:<10} "
-                f"recall_rank={str(video_rank):<4} "
-                f"auto_rank={str(auto_video_rank):<4} "
-                f"shown={str(shown):<5} "
-                f"rescued={str(rescued):<5} "
-                f"thumb={str(first_thumbnail):<4} "
-                f"frame_hit={str(frame_hit):<5} "
-                f"gap={str(nearest_gap):<5} ({gap_s_text})"
+                f"recall_rank={video_rank!s:<4} "
+                f"auto_rank={auto_video_rank!s:<4} "
+                f"shown={shown!s:<5} "
+                f"rescued={rescued!s:<5} "
+                f"thumb={first_thumbnail!s:<4} "
+                f"frame_hit={frame_hit!s:<5} "
+                f"gap={nearest_gap!s:<5} ({gap_s_text})"
             )
     finally:
         engine.close()
