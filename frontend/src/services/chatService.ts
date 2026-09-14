@@ -1,5 +1,5 @@
 import { ApiClient } from "./apiClient";
-import { SolveRequest, SolveResponse, HealthResponse } from "./types";
+import { BackendTask, SolveRequest, SolveResponse, HealthResponse, RetrievalMode } from "./types";
 
 export class ChatService {
   /**
@@ -14,8 +14,8 @@ export class ChatService {
     try {
       const allFiles = req.files || (req.file ? [req.file] : []);
 
-      // Backend hiện tại nhận JSON theo contract của aic.api:
-      //   text, task, query_id, ...
+      // Backend nhận JSON theo contract của aic.api:
+      //   text, task (kis|qa|trake), query_id, answers, pins, top
       // Nó KHÔNG nhận multipart/form-data ở /solve.
       if (allFiles.length > 0) {
         throw new Error(
@@ -23,10 +23,19 @@ export class ChatService {
         );
       }
 
+      const taskByMode: Record<RetrievalMode, BackendTask> = {
+        kis: "kis",
+        qna: "qa",
+        trake: "trake",
+      };
+
       return await ApiClient.post<SolveResponse>("/solve", {
         text: req.query,
-        task: req.mode,
+        task: taskByMode[req.mode] ?? req.mode,
         query_id: req.query_id || `q_${Date.now()}`,
+        top: req.top_k,
+        answers: req.answers,
+        pins: req.pins,
         ...req.params,
       });
     } catch (err: any) {
@@ -40,8 +49,8 @@ export class ChatService {
         message.includes("Load failed")
       ) {
         throw new Error(
-          "BACKEND_UNREACHABLE: Browser cannot access Backend Engine at http://localhost:8000. " +
-            "If /health is 200 in the server log, check CORS configuration."
+          `BACKEND_UNREACHABLE: Browser cannot access Backend Engine at ${ApiClient.getBaseUrl()}. ` +
+            "If /health is 200 in the server log, check CORS (Vite may be on a port other than 5173)."
         );
       }
 
@@ -88,17 +97,28 @@ export class ChatService {
     // 2. Kiểm tra kết nối tới Backend Engine (:8000)
     try {
       const health = await ApiClient.get<HealthResponse>("/health", { timeoutMs: 2500 });
-
-      // 3. Backend exposes engine warnings under health.engine.warnings.
+      const detail = health.detail || "";
       const warnings = health.engine?.warnings ?? health.warnings ?? [];
-      if (health.status === "degraded" || warnings.length > 0) {
-        const warningStr = warnings.join(" ").toLowerCase();
-        const corpusProblem =
-          warningStr.includes("index") ||
-          warningStr.includes("video") ||
-          warningStr.includes("corpus") ||
-          warningStr.includes("dense");
+      const haystack = [health.status, detail, ...warnings].join(" ").toLowerCase();
+      const corpusProblem =
+        haystack.includes("index") ||
+        haystack.includes("video") ||
+        haystack.includes("corpus") ||
+        haystack.includes("dense");
 
+      if (health.status === "error" || health.status === "loading") {
+        return {
+          type: corpusProblem ? "no_video" : "backend_disconnected",
+          title: corpusProblem ? "NO_VIDEO_IMPORTED_" : "BACKEND_DISCONNECTED_",
+          description: corpusProblem
+            ? "Video corpus or dense vector index is not usable. Check the backend /health details."
+            : "Backend Engine is running but the retrieval engine is not ready.",
+          level: "error",
+          details: detail || warnings.join("; ") || health.status,
+        };
+      }
+
+      if (health.status === "degraded" || warnings.length > 0) {
         if (corpusProblem) {
           return {
             type: "no_video",
@@ -106,9 +126,17 @@ export class ChatService {
             description:
               "Video corpus or dense vector index is not usable. Check the backend /health details.",
             level: "warning",
-            details: warnings.join("; "),
+            details: warnings.join("; ") || detail,
           };
         }
+        return {
+          type: "no_video",
+          title: "ENGINE_DEGRADED_",
+          description:
+            "Backend Engine loaded in a degraded state. Results are not usable for a submission.",
+          level: "warning",
+          details: warnings.join("; ") || detail,
+        };
       }
 
       return null;
@@ -118,7 +146,7 @@ export class ChatService {
         type: "backend_disconnected",
         title: "BACKEND_DISCONNECTED_",
         description:
-          "Unable to connect to Engine Façade at http://localhost:8000. Ensure 'uv run aic serve' is running.",
+          `Unable to connect to Engine Façade at ${ApiClient.getBaseUrl()}. Ensure 'uv run aic serve' is running.`,
         level: "error",
       };
     }

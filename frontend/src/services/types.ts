@@ -4,6 +4,17 @@
  */
 
 export type RetrievalMode = "kis" | "qna" | "trake";
+export type BackendTask = "kis" | "qa" | "trake";
+
+export interface AnswerHypothesis {
+  text: string;
+  prob?: number;
+}
+
+export interface Pin {
+  video_id: string;
+  frame: number;
+}
 
 // 1. DTO cho Backend API: POST /solve
 export interface SolveRequest {
@@ -13,6 +24,8 @@ export interface SolveRequest {
   file?: File;
   files?: File[];
   top_k?: number;
+  answers?: AnswerHypothesis[];
+  pins?: Pin[];
   params?: Record<string, any>;
 }
 
@@ -21,6 +34,7 @@ export interface SolveAnswerItem {
   rank: number;
   video_id: string;
   frame_id: number | string;
+  frame_ids?: number[];
   gain?: number;
   cumulative?: number;
   source?: string;

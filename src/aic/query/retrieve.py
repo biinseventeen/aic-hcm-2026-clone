@@ -32,19 +32,18 @@ member as a cheap hedge for the lower slot bands.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..core.fusion import ChannelResult, reciprocal_rank_fusion, weights_for_query
 from ..core.align import monotonic_align
+from ..core.fusion import ChannelResult, reciprocal_rank_fusion, weights_for_query
 from ..data.features import DenseIndex
 from ..index.priors import DomainPrior
 from ..index.shots import ShotTable
 from ..index.text import TextIndex
 from .parse import ParsedQuery
-
-import re
 
 __all__ = ["Candidate", "RetrievalResult", "Retriever"]
 
@@ -190,10 +189,7 @@ def dense_query_parts(query: ParsedQuery) -> list[str]:
     The original full query remains a separate dense channel, so decomposition
     can add recall but cannot destroy the existing signal.
     """
-    if query.moments:
-        raw_parts = query.moments
-    else:
-        raw_parts = _QUERY_PART_SPLIT.split(query.raw)
+    raw_parts = query.moments or _QUERY_PART_SPLIT.split(query.raw)
 
     parts: list[str] = []
     seen: set[str] = set()
@@ -302,8 +298,8 @@ class Retriever:
             ranked.append(key)
             raw[key] = float(score)
         return ChannelResult(name=name, ranked=ranked, scores=raw)
-    
-    
+
+
     def _dense_parts_channel(
         self,
         query: ParsedQuery,
@@ -411,7 +407,7 @@ class Retriever:
             if sim > best.get(shot_id, -2.0):
                 best[shot_id] = sim
         return [shot_id for shot_id, _ in sorted(best.items(), key=lambda kv: -kv[1])[:limit]]
-    
+
     def _temporal_kis_channel(
         self,
         query: ParsedQuery,
@@ -565,7 +561,7 @@ class Retriever:
             ChannelResult(
                 name=name,
                 ranked=[key for key, _score in ranked_with_scores],
-                scores={key: score for key, score in ranked_with_scores},
+                scores=dict(ranked_with_scores),
             ),
             anchors,
             spans,
@@ -907,10 +903,7 @@ class Retriever:
                     key
                     for key, _score in ranked_with_scores
                 ],
-                scores={
-                    key: score
-                    for key, score in ranked_with_scores
-                },
+                scores=dict(ranked_with_scores),
             ),
             anchors,
         )
@@ -982,7 +975,7 @@ class Retriever:
                     query.raw, "dense_multilingual", encoder=self.encoder_multilingual
                 )
             )
-            
+
         if self.encoder_multilingual is not None:
             parts_channel = self._dense_parts_channel(
                 query,
@@ -1028,7 +1021,7 @@ class Retriever:
                         ranked=[],
                     )
                 )
-        
+
         channels.append(self._entity_channel(query, "entity_fuzzy", query_vector=query_vector))
 
         channel_weights = weights or weights_for_query(
@@ -1211,13 +1204,13 @@ class Retriever:
             eta=self.rrf_eta,
             depth=self.channel_depth,
         )
-        
+
         """ fused = [
             item
             for item in fused
             if item.item[0].startswith("L21_")
         ] """
-        
+
 
         result = RetrievalResult(
             recall_video_scores=recall_video_scores,

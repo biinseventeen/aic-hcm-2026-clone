@@ -27,18 +27,32 @@ from __future__ import annotations
 import json
 import os
 import threading
-import zipfile
 from pathlib import Path
 from typing import Any
 
 from ..log import log
 from ..service import Engine
+from .preview import (
+    PreviewLookupError,
+    enrich_for_ui,
+    enrich_review,
+    keyframe_local_path,
+    local_data_path,
+    nearest_keyframe,
+    public_base_url,
+    require_video_id,
+)
 from .schemas import (
     BatchSolveRequest,
     ErrorResponse,
     HealthResponse,
+    PackageRequest,
+    ReviewRequest,
     SolveRequest,
     SolveResponse,
+    SubmitRequest,
+    normalise_query_id,
+    normalise_task,
 )
 
 __all__ = ["create_app", "get_engine", "reset_engine"]
@@ -124,15 +138,18 @@ def create_app(*, eager: bool | None = None) -> Any:
         lifespan=lifespan,
     )
 
-    # Vite dev server runs on a different origin (:5173) from FastAPI (:8000).
-    # Without CORS middleware the browser blocks even successful /health responses,
-    # and POST /solve fails at the OPTIONS preflight with 405 Method Not Allowed.
+    # Vite may hop off :5173 when that port is taken (this machine used :5174).
+    # A fixed origin list would make the browser treat /health as a network failure
+    # (BACKEND_DISCONNECTED) even though the engine is up.
     api.add_middleware(
         CORSMiddleware,
         allow_origins=[
             "http://localhost:5173",
             "http://127.0.0.1:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5174",
         ],
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -157,210 +174,42 @@ def create_app(*, eager: bool | None = None) -> Any:
         except ValueError as exc:
             raise HTTPException(422, ErrorResponse("invalid input", str(exc)).to_dict()) from exc
 
-    def _nearest_keyframe(engine: Engine, video_id: str, frame_id: int) -> dict[str, Any]:
-        """Map an arbitrary submission frame to the nearest supplied keyframe."""
-        table = engine.tables.get(video_id)
-        if table is None:
-            raise HTTPException(
-                404,
-                ErrorResponse(f"no video {video_id!r}").to_dict(),
-            )
+    def preview_http(exc: PreviewLookupError) -> HTTPException:
+        return HTTPException(exc.status, ErrorResponse(exc.message, exc.detail).to_dict())
 
-        frames = [int(value) for value in table.frame_idx]
-        if not frames:
-            raise HTTPException(
-                404,
-                ErrorResponse(f"video {video_id!r} has no keyframes").to_dict(),
-            )
-
-        index = min(
-            range(len(frames)),
-            key=lambda i: abs(frames[i] - int(frame_id)),
-        )
-        n = int(table.n[index])
-        preview_frame = frames[index]
-        fps = float(table.fps or 25.0)
-
-        pts_values = getattr(table, "pts_time", None)
-        if pts_values is not None and len(pts_values) > index:
-            pts_time = float(pts_values[index])
-        else:
-            pts_time = preview_frame / fps
-
-        return {
-            "n": n,
-            "preview_frame": preview_frame,
-            "requested_frame": int(frame_id),
-            "fps": fps,
-            "pts_time": pts_time,
-        }
-
-    def _local_data_path(engine: Engine, family: str, relative: str) -> Path | None:
-        """Find an extracted organiser artefact without fabricating data."""
-        source = getattr(engine.root, family, None)
-        if source is not None:
-            local_path = getattr(source, "local_path", None)
-            if callable(local_path):
-                try:
-                    path = local_path(relative)
-                    if path is not None and Path(path).is_file():
-                        return Path(path)
-                except Exception:
-                    pass
-
-        data_root = Path(engine.cfg.paths.data_root)
-        for path in (
-            data_root / "extracted" / relative,
-            data_root / relative,
-        ):
-            if path.is_file():
-                return path
-        return None
-
-    def _public_base_url() -> str:
-        """URL the browser should use for preview/detection images."""
-        return os.environ.get(
-            "AIC_API_PUBLIC_URL",
-            "http://127.0.0.1:8000",
-        ).rstrip("/")
-
-    def _keyframe_local_path(
-        engine: Engine,
-        video_id: str,
-        n: int,
-    ) -> Path:
-        """Return a real JPEG path for one organiser keyframe.
-
-        The corpus can be in several equivalent layouts:
-        - extracted/keyframes/<video>/<nnn>.jpg
-        - keyframes/<video>/<nnn>.jpg
-        - Keyframes_*.zip
-
-        ``DataRoot`` abstracts these for the retrieval code, but ``FileResponse``
-        needs an actual filesystem path.  If the keyframe exists only in a zip,
-        extract exactly that one JPEG into a small UI cache.
-        """
-        filename = f"{n:03d}.jpg"
-        key = f"keyframes/{video_id}/{filename}"
-        flat_key = f"{video_id}/{filename}"
-        relative_flat = Path(video_id) / filename
-
-        # 1) Ask the repository source abstraction first. Different source
-        # implementations may expect either the full key or a family-relative key.
-        source = engine.root.keyframes
-        local_path = getattr(source, "local_path", None)
-        if callable(local_path):
-            for source_key in (key, flat_key):
-                try:
-                    path = local_path(source_key)
-                    if path is not None and Path(path).is_file():
-                        return Path(path)
-                except Exception:
-                    pass
-
-        # 2) Check the known extracted layouts. Include both the resolved config
-        # root and the repository-local junction because either may be used.
-        roots: list[Path] = []
-        for candidate_root in (
-            Path(engine.cfg.paths.data_root),
-            Path("data/batch1"),
-        ):
-            try:
-                candidate_root = candidate_root.resolve()
-            except OSError:
-                pass
-            if candidate_root not in roots:
-                roots.append(candidate_root)
-
-        for data_root in roots:
-            candidates = (
-                data_root / "extracted" / "keyframes" / relative_flat,
-                data_root / "extracted" / key,
-                data_root / "keyframes" / relative_flat,
-                data_root / key,
-            )
-            for path in candidates:
-                if path.is_file():
-                    return path
-
-        # 3) Archive fallback: extract only the requested keyframe, never the
-        # whole 28+ GiB family.
-        cache_path = (
-            Path("data/processed/keyframe_cache")
-            / video_id
-            / filename
-        )
-        if cache_path.is_file():
-            return cache_path
-
-        archive_entries = (key, flat_key)
-        for data_root in roots:
-            for archive_path in sorted(data_root.glob("Keyframes_*.zip")):
-                try:
-                    with zipfile.ZipFile(archive_path) as archive:
-                        names = set(archive.namelist())
-                        entry = next(
-                            (
-                                candidate
-                                for candidate in archive_entries
-                                if candidate in names
-                            ),
-                            None,
-                        )
-                        if entry is None:
-                            continue
-
-                        cache_path.parent.mkdir(parents=True, exist_ok=True)
-                        cache_path.write_bytes(archive.read(entry))
-                        return cache_path
-                except (OSError, zipfile.BadZipFile):
-                    continue
-
-        raise FileNotFoundError(
-            f"cannot locate {key}; checked DataRoot.local_path, extracted "
-            "keyframe layouts, and Keyframes_*.zip"
+    def solve_engine(engine: Engine, request: SolveRequest):
+        return engine.solve(
+            request.text,
+            query_id=request.query_id,
+            task_hint=request.task,  # type: ignore[arg-type]
+            hedge_answers=request.hedge_answers,
+            answers=request.engine_answers(),
+            pins=request.engine_pins(),
         )
 
-    def _preview_metadata(
-        engine: Engine,
-        video_id: str,
-        frame_id: int,
-        *,
-        base_url: str,
-    ) -> dict[str, Any]:
-        nearest = _nearest_keyframe(engine, video_id, frame_id)
-        return {
-            "timestamp_seconds": round(int(frame_id) / nearest["fps"], 3),
-            "timestamp": f'{int(frame_id) / nearest["fps"]:.2f}s',
-            "image_url": f"{base_url}/frames/{video_id}/{int(frame_id)}",
-            "preview_frame_id": nearest["preview_frame"],
-            "preview_keyframe_n": nearest["n"],
-        }
+    def solve_payload(engine: Engine, result: Any, *, top: int | None) -> dict[str, Any]:
+        payload = SolveResponse.of(result, top=top).to_dict()
+        return enrich_for_ui(payload, engine, base_url=public_base_url())
 
-    def _enrich_answer_previews(
-        payload: dict[str, Any],
-        engine: Engine,
-        *,
-        base_url: str,
-    ) -> dict[str, Any]:
-        """Add UI-only preview metadata without changing ranking/submission fields."""
-        for answer in payload.get("answers", []):
-            video_id = answer.get("video_id")
-            frame_id = answer.get("frame_id")
-            if not video_id or frame_id is None:
-                continue
-            try:
-                answer.update(
-                    _preview_metadata(
-                        engine,
-                        str(video_id),
-                        int(frame_id),
-                        base_url=base_url,
-                    )
-                )
-            except (TypeError, ValueError, HTTPException):
-                continue
-        return payload
+    def issues_json(issues: list) -> list[dict[str, Any]]:
+        return [
+            {
+                "severity": issue.severity,
+                "query_id": issue.query_id,
+                "message": issue.message,
+                "row": issue.row,
+            }
+            for issue in issues
+        ]
+
+    def submission_matches(directory: Path, query_id: str, task: str | None) -> list[Path]:
+        from ..submit.writer import SubmissionNaming
+
+        if task:
+            path = directory / SubmissionNaming().file_for(query_id, task)  # type: ignore[arg-type]
+            return [path] if path.is_file() else []
+        pattern = f"query-{query_id}-*.csv"
+        return sorted({*directory.glob(pattern), *directory.glob(f"*/{pattern}")})
 
     @api.get("/health", tags=["operations"])
     def health() -> dict:
@@ -380,25 +229,14 @@ def create_app(*, eager: bool | None = None) -> Any:
         engine = engine_or_503()
         with _slots:
             try:
-                result = engine.solve(
-                    validated.text,
-                    query_id=validated.query_id,
-                    task_hint=validated.task,
-                    hedge_answers=validated.hedge_answers,
-                )
+                result = solve_engine(engine, validated)
             except ValueError as exc:
                 # Syntactically valid but unsolvable (for example a TRAKE query with no moments) —
                 # an input error, not a system error.
                 raise HTTPException(
                     422, ErrorResponse("query could not be solved", str(exc)).to_dict()
                 ) from exc
-
-        payload = SolveResponse.of(result, top=validated.top).to_dict()
-        return _enrich_answer_previews(
-            payload,
-            engine,
-            base_url=_public_base_url(),
-        )
+        return solve_payload(engine, result, top=validated.top)
 
     @api.post("/solve/batch", tags=["queries"])
     def solve_batch(request: BatchSolveRequest) -> dict:
@@ -412,13 +250,8 @@ def create_app(*, eager: bool | None = None) -> Any:
         for query in batch.queries:
             with _slots:
                 try:
-                    result = engine.solve(
-                        query.text,
-                        query_id=query.query_id,
-                        task_hint=query.task,
-                        hedge_answers=query.hedge_answers,
-                    )
-                    results.append(SolveResponse.of(result, top=query.top).to_dict())
+                    result = solve_engine(engine, query)
+                    results.append(solve_payload(engine, result, top=query.top))
                 except Exception as exc:
                     errors.append(
                         {
@@ -437,7 +270,7 @@ def create_app(*, eager: bool | None = None) -> Any:
     def parse(request: SolveRequest) -> dict:
         """Parse a query only — fast, no retrieval. Used to inspect query understanding."""
         validated = validated_or_422(request)
-        query = engine_or_503().parse(validated.text, task_hint=validated.task)
+        query = engine_or_503().parse(validated.text, task_hint=validated.task)  # type: ignore[arg-type]
         return {
             "raw": query.raw,
             "task": query.task,
@@ -453,9 +286,117 @@ def create_app(*, eager: bool | None = None) -> Any:
             "domain_hints": list(query.domain_hints),
         }
 
+    @api.post("/review", tags=["queries"])
+    def review(request: ReviewRequest) -> dict:
+        """Human-review shortlist. Does not run P10/P13 or write a submission."""
+        try:
+            validated = request.validated()
+        except ValueError as exc:
+            raise HTTPException(422, ErrorResponse("invalid input", str(exc)).to_dict()) from exc
+        engine = engine_or_503()
+        with _slots:
+            result = engine.review(validated.text, task_hint=validated.task)  # type: ignore[arg-type]
+        payload = result.to_dict()
+        payload["query_id"] = validated.query_id
+        return enrich_review(payload, engine, base_url=public_base_url())
+
+    @api.post("/submit", tags=["submission"])
+    def submit(request: SubmitRequest) -> dict:
+        """Solve one query and write ``query-<id>-<task>.csv``. Errors do not write."""
+        try:
+            validated = request.validated()
+        except ValueError as exc:
+            raise HTTPException(422, ErrorResponse("invalid input", str(exc)).to_dict()) from exc
+        engine = engine_or_503()
+        with _slots:
+            try:
+                result = solve_engine(engine, validated)
+            except ValueError as exc:
+                raise HTTPException(
+                    422, ErrorResponse("query could not be solved", str(exc)).to_dict()
+                ) from exc
+        try:
+            path, issues = engine.write(result, strict=validated.strict)
+        except ValueError as exc:
+            raise HTTPException(
+                422, ErrorResponse("submission not written", str(exc)).to_dict()
+            ) from exc
+        payload = solve_payload(engine, result, top=validated.top)
+        payload["path"] = str(path)
+        payload["filename"] = path.name
+        payload["issues"] = issues_json(issues)
+        return payload
+
+    @api.get("/submit/{query_id}", tags=["submission"])
+    def download_submission(query_id: str, task: str | None = Query(default=None)):
+        """Download a CSV already written by ``POST /submit`` or ``aic run``."""
+        try:
+            query_id = normalise_query_id(query_id)
+            task = normalise_task(task)
+        except ValueError as exc:
+            raise HTTPException(422, ErrorResponse("invalid input", str(exc)).to_dict()) from exc
+        engine = engine_or_503()
+        directory = Path(engine.cfg.paths.submission_dir)
+        matches = submission_matches(directory, query_id, task)
+        if not matches:
+            raise HTTPException(
+                404, ErrorResponse(f"no submission file for query {query_id!r}").to_dict()
+            )
+        if len(matches) > 1:
+            names = ", ".join(path.name for path in matches)
+            raise HTTPException(
+                409,
+                ErrorResponse(
+                    "ambiguous query_id",
+                    f"several files match {query_id!r}: {names}. Pass ?task=kis|qa|trake.",
+                ).to_dict(),
+            )
+        path = matches[0]
+        return FileResponse(path, media_type="text/csv", filename=path.name)
+
+    @api.post("/submit/package", tags=["submission"])
+    def package(request: PackageRequest) -> dict:
+        """Zip written CSVs into an archive that contains a ``submission/`` directory."""
+        try:
+            validated = request.validated()
+        except ValueError as exc:
+            raise HTTPException(422, ErrorResponse("invalid input", str(exc)).to_dict()) from exc
+        engine = engine_or_503()
+        from ..submit.writer import package_submission
+
+        directory = Path(engine.cfg.paths.submission_dir)
+        if validated.set_name:
+            directory = directory / validated.set_name
+        files: list[Path] = []
+        missing: list[str] = []
+        for query_id in validated.query_ids:
+            matches = submission_matches(directory, query_id, None)
+            if not matches:
+                missing.append(query_id)
+            else:
+                files.extend(matches)
+        if missing:
+            raise HTTPException(
+                404,
+                ErrorResponse(
+                    "submission files missing",
+                    f"no CSV for query_id(s): {', '.join(missing)}",
+                ).to_dict(),
+            )
+        archive = package_submission(files, directory / validated.zip_name)
+        return {
+            "path": str(archive),
+            "filename": archive.name,
+            "n_files": len(files),
+        }
+
     @api.get("/videos/{video_id}", tags=["data"])
     def video(video_id: str) -> dict:
         """Frame metadata for one video — enough for a client to convert frame_id to a time."""
+        try:
+            require_video_id(video_id)
+        except PreviewLookupError as exc:
+            raise preview_http(exc) from exc
         engine = engine_or_503()
         table = engine.tables.get(video_id)
         if table is None:
@@ -472,22 +413,20 @@ def create_app(*, eager: bool | None = None) -> Any:
     @api.get("/frames/{video_id}/{frame_id}", tags=["data"])
     def frame_preview(video_id: str, frame_id: int):
         """JPEG nearest to a requested source-video frame for human inspection."""
-        engine = engine_or_503()
-        nearest = _nearest_keyframe(engine, video_id, frame_id)
-        relative = f"keyframes/{video_id}/{nearest['n']:03d}.jpg"
         try:
-            path = _keyframe_local_path(
-                engine,
-                video_id,
-                int(nearest["n"]),
-            )
+            require_video_id(video_id)
+        except PreviewLookupError as exc:
+            raise preview_http(exc) from exc
+        engine = engine_or_503()
+        try:
+            nearest = nearest_keyframe(engine, video_id, frame_id)
+            path = keyframe_local_path(engine, video_id, int(nearest["n"]))
+        except PreviewLookupError as exc:
+            raise preview_http(exc) from exc
         except FileNotFoundError as exc:
             raise HTTPException(
                 404,
-                ErrorResponse(
-                    "keyframe preview unavailable",
-                    str(exc),
-                ).to_dict(),
+                ErrorResponse("keyframe preview unavailable", str(exc)).to_dict(),
             ) from exc
 
         return FileResponse(
@@ -508,10 +447,17 @@ def create_app(*, eager: bool | None = None) -> Any:
         limit: int = Query(8, ge=1, le=50),
     ) -> list[dict[str, Any]]:
         """Real organiser-supplied Open Images detections near one frame."""
+        try:
+            require_video_id(video_id)
+        except PreviewLookupError as exc:
+            raise preview_http(exc) from exc
         engine = engine_or_503()
-        nearest = _nearest_keyframe(engine, video_id, frame_id)
+        try:
+            nearest = nearest_keyframe(engine, video_id, frame_id)
+        except PreviewLookupError as exc:
+            raise preview_http(exc) from exc
         relative = f"objects/{video_id}/{nearest['n']:03d}.json"
-        path = _local_data_path(engine, "objects", relative)
+        path = local_data_path(engine, "objects", relative)
         if path is None:
             return []
 
@@ -523,13 +469,10 @@ def create_app(*, eager: bool | None = None) -> Any:
         entities = list(payload.get("detection_class_entities") or [])
         scores = list(payload.get("detection_scores") or [])
         boxes = list(payload.get("detection_boxes") or [])
-
-        image_url = (
-            f"{_public_base_url()}/frames/{video_id}/{frame_id}"
-        )
+        image_url = f"{public_base_url()}/frames/{video_id}/{frame_id}"
 
         rows: list[dict[str, Any]] = []
-        for index, (entity, score_raw) in enumerate(zip(entities, scores)):
+        for index, (entity, score_raw) in enumerate(zip(entities, scores, strict=False)):
             try:
                 score = float(score_raw)
             except (TypeError, ValueError):

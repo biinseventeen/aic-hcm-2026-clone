@@ -219,6 +219,9 @@ function Chat({ mode = "kis", onQueryExecuted }: ChatProps) {
     } else if (mode === "trake") {
       // Format TRAKE: <video_id>,<frame_1>,...,<frame_N>
       const rows = results.answers.map((ans) => {
+        if (ans.frame_ids && ans.frame_ids.length > 0) {
+          return [ans.video_id, ...ans.frame_ids];
+        }
         if (ans.milestones && ans.milestones.length > 0) {
           return [ans.video_id, ...ans.milestones.map((m) => m.frameId)];
         }
